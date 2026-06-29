@@ -592,7 +592,9 @@ async def _call_cursor_direct(
     start_time = time.monotonic()
     request_id = f"cc_{uuid.uuid4().hex[:12]}"
 
-    injected_base = inject_tool_prompt_into_messages(messages, tools)
+    injected_base = inject_tool_prompt_into_messages(
+        messages, tools, composer=is_composer_model(model)
+    )
     has_valid_tools = bool(valid_tool_names)
     all_valid_names = list(valid_tool_names) + (["task_complete"] if has_valid_tools else [])
 
@@ -691,8 +693,14 @@ async def _call_cursor_direct(
         if all_valid_names:
             # Composer emits tool calls as DeepSeek text tokens (parsed from the
             # thinking stream into composer_tool_calls), not Anthropic JSON.
+            # Fall back to JSON text parsing if it emits JSON anyway.
             if is_composer:
-                parsed_tcs = normalize_tool_calls(consumed.get("composer_tool_calls") or [])
+                composer_tcs = consumed.get("composer_tool_calls") or []
+                parsed_tcs = (
+                    normalize_tool_calls(composer_tcs)
+                    if composer_tcs
+                    else try_parse_tool_calls_from_text(consumed["text"])
+                )
             else:
                 parsed_tcs = try_parse_tool_calls_from_text(consumed["text"])
             if parsed_tcs:
@@ -803,7 +811,12 @@ async def _call_cursor_direct(
 
             retry_tcs: list[dict] = []
             if is_composer:
-                parsed_retry = normalize_tool_calls(consumed_c.get("composer_tool_calls") or [])
+                composer_retry = consumed_c.get("composer_tool_calls") or []
+                parsed_retry = (
+                    normalize_tool_calls(composer_retry)
+                    if composer_retry
+                    else try_parse_tool_calls_from_text(retry_text)
+                )
             else:
                 parsed_retry = try_parse_tool_calls_from_text(retry_text)
             if parsed_retry:

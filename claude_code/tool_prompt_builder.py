@@ -12,6 +12,9 @@ import logging
 import re
 
 from config.system_prompt import (
+    COMPOSER_TOOL_PROMPT_HEADER,
+    COMPOSER_TURN1_USER,
+    COMPOSER_TURN2_ASSISTANT,
     DECONTAMINATION_REMINDER,
     TURN1_USER,
     TURN2_ASSISTANT,
@@ -52,23 +55,29 @@ ASK_MODE_CONTAMINATION_PATTERNS: list[re.Pattern] = [
 ]
 
 
-def build_tool_call_prompt(tools: list[dict]) -> str:
+def build_tool_call_prompt(tools: list[dict], composer: bool = False) -> str:
     """Build a text prompt describing available tools.
 
-    The model should output tool calls as Anthropic native JSON:
+    Non-composer models output tool calls as Anthropic native JSON:
       {"type":"tool_use","id":"toolu_xxx","name":"ToolName","input":{...}}
+
+    Composer-2.x models use their native tool-call marker protocol instead, so
+    they get a marker-format header and are told to use the client tool names.
     """
-    lines = [
-        "You have access to the following tools.\n"
-        "When you need to perform an action, output Anthropic native tool_use JSON — "
-        "one per line, each on its own line after any text:\n"
-        '  {"type":"tool_use","id":"toolu_<unique>","name":"<ToolName>","input":{<params>}}\n\n'
-        "Examples:\n"
-        '  {"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls -la"}}\n'
-        '  {"type":"tool_use","id":"toolu_02","name":"Read","input":{"file_path":"/tmp/app.go"}}\n'
-        '  {"type":"tool_use","id":"toolu_03","name":"Write","input":{"file_path":"/tmp/app.go","content":"package main\\n"}}\n'
-        '  {"type":"tool_use","id":"toolu_04","name":"Edit","input":{"file_path":"/tmp/app.go","old_string":"old","new_string":"new"}}\n'
-    ]
+    if composer:
+        lines = [COMPOSER_TOOL_PROMPT_HEADER]
+    else:
+        lines = [
+            "You have access to the following tools.\n"
+            "When you need to perform an action, output Anthropic native tool_use JSON — "
+            "one per line, each on its own line after any text:\n"
+            '  {"type":"tool_use","id":"toolu_<unique>","name":"<ToolName>","input":{<params>}}\n\n'
+            "Examples:\n"
+            '  {"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls -la"}}\n'
+            '  {"type":"tool_use","id":"toolu_02","name":"Read","input":{"file_path":"/tmp/app.go"}}\n'
+            '  {"type":"tool_use","id":"toolu_03","name":"Write","input":{"file_path":"/tmp/app.go","content":"package main\\n"}}\n'
+            '  {"type":"tool_use","id":"toolu_04","name":"Edit","input":{"file_path":"/tmp/app.go","old_string":"old","new_string":"new"}}\n'
+        ]
 
     count = 0
     for tool_def in tools:
@@ -101,9 +110,15 @@ def build_tool_call_prompt(tools: list[dict]) -> str:
             f"  Parameters:\n{params_block}"
         )
 
-    lines.append(
-        f"\nTotal: {count} tool(s). Use tool_use JSON for ALL actions — never narrate."
-    )
+    if composer:
+        lines.append(
+            f"\nTotal: {count} tool(s). Call these EXACT names via the marker protocol "
+            "for ALL actions — never use built-in tools, never narrate."
+        )
+    else:
+        lines.append(
+            f"\nTotal: {count} tool(s). Use tool_use JSON for ALL actions — never narrate."
+        )
 
     return "\n\n".join(lines)
 
@@ -261,11 +276,20 @@ def _is_contaminated_assistant_message(content: str) -> bool:
     return any(p.search(content) for p in ASK_MODE_CONTAMINATION_PATTERNS)
 
 
-def _build_brief_reminder(tools: list[dict]) -> str:
+def _build_brief_reminder(tools: list[dict], composer: bool = False) -> str:
     """Compact tool-name reminder injected periodically into conversation."""
     names = [(t.get("function") or t).get("name", "") for t in tools
              if (t.get("function") or t).get("name")]
     names.append("task_complete")
+    if composer:
+        return (
+            f'[TOOL_REMINDER] {len(names)} client tools: {", ".join(names)}. '
+            'ALWAYS execute via the marker protocol using these EXACT names — '
+            'never use built-in tools (search_files/read_file/edit_file/skill_view), '
+            'never narrate or simulate a call. '
+            'Only task_complete signals "done"; no task_complete = keep working. '
+            'Format: <|tool_calls_begin|><|tool_call_begin|>NAME<|tool_sep|>arg\\nvalue<|tool_call_end|><|tool_calls_end|>'
+        )
     return (
         f'[TOOL_REMINDER] {len(names)} tools: {", ".join(names)}. '
         'ALWAYS execute tools via tool_use JSON — never narrate or simulate a call. '
@@ -277,20 +301,25 @@ def _build_brief_reminder(tools: list[dict]) -> str:
 def inject_tool_prompt_into_messages(
     messages: list[dict], tools: list[dict],
     reminder_interval: int = 10,
+    composer: bool = False,
 ) -> list[dict]:
     """Inject tool schemas and system turns into messages.
 
     Inserts full tool descriptions (via build_tool_call_prompt) so the model
     knows every available tool and its parameters.  Uses Anthropic native JSON
     format for tool_use/tool_result serialization in conversation history.
+
+    When ``composer`` is True the priming turns and tool prompt instruct the
+    Composer-2.x marker protocol (and the use of client tool names) instead of
+    Anthropic tool_use JSON.
     """
     result: list[dict] = []
 
-    result.append({"role": "user", "content": TURN1_USER})
-    result.append({"role": "assistant", "content": TURN2_ASSISTANT})
+    result.append({"role": "user", "content": COMPOSER_TURN1_USER if composer else TURN1_USER})
+    result.append({"role": "assistant", "content": COMPOSER_TURN2_ASSISTANT if composer else TURN2_ASSISTANT})
 
     if tools:
-        tool_prompt = build_tool_call_prompt(tools)
+        tool_prompt = build_tool_call_prompt(tools, composer=composer)
         result.append({"role": "user", "content": tool_prompt})
         result.append({"role": "assistant", "content": "(tools noted, ready to use them)"})
 
@@ -369,7 +398,7 @@ def inject_tool_prompt_into_messages(
         result.append(m)
 
     if tools and reminder_interval > 0:
-        reminder = _build_brief_reminder(tools)
+        reminder = _build_brief_reminder(tools, composer=composer)
         result = _inject_periodic_reminders(result, reminder, reminder_interval)
 
     result = _merge_consecutive_same_role(result)
