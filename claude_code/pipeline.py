@@ -427,40 +427,10 @@ class _ThinkTagSplitter:
         return "", remaining
 
 
-def _is_composer_model(model: str) -> bool:
-    """Composer-family models stream their answer through the protobuf thinking
-    field (25) instead of content (1). Their thinking must be surfaced as text,
-    otherwise the Anthropic response has empty content."""
-    return model.lower().startswith("composer")
-
-
-# Composer concatenates reasoning + answer in the thinking field, separated by
-# one of these markers; the real answer is everything after the last marker.
-_COMPOSER_FINAL_MARKERS = ("<｜final｜>", "</think>")
-
-
-def _split_composer_final(text: str) -> tuple[str, str]:
-    """Split composer's bundled thinking-field content into (answer, reasoning).
-
-    Returns the whole string as the answer when no marker is present.
-    """
-    last_idx, marker_len = -1, 0
-    for marker in _COMPOSER_FINAL_MARKERS:
-        idx = text.rfind(marker)
-        if idx > last_idx:
-            last_idx, marker_len = idx, len(marker)
-    if last_idx < 0:
-        return text, ""
-    answer = text[last_idx + marker_len:].replace("</think>", "").lstrip("\n")
-    reasoning = text[:last_idx]
-    return answer, reasoning
-
-
 async def consume_stream(
     stream_iterator: AsyncIterator[bytes],
     on_text_delta: Callable[[str], Any] | None = None,
     on_thinking_delta: Callable[[str], Any] | None = None,
-    thinking_as_text: bool = False,
 ) -> dict:
     """Consume a Cursor protobuf stream, accumulating text/thinking/errors.
 
@@ -503,20 +473,11 @@ async def consume_stream(
                     has_fatal_error = True
 
         if result.thinking:
-            if thinking_as_text:
-                # Composer routes its answer through the thinking field; emit it
-                # as visible text instead of a separate thinking channel.
-                text += result.thinking
-                text_delta_count += 1
-                had_content = True
-                if on_text_delta:
-                    on_text_delta(result.thinking)
-            else:
-                thinking += result.thinking
-                thinking_delta_count += 1
-                had_content = True
-                if on_thinking_delta:
-                    on_thinking_delta(result.thinking)
+            thinking += result.thinking
+            thinking_delta_count += 1
+            had_content = True
+            if on_thinking_delta:
+                on_thinking_delta(result.thinking)
 
         if result.text:
             think_part, text_part = splitter.feed(result.text)
@@ -549,14 +510,6 @@ async def consume_stream(
         had_content = True
         if on_text_delta:
             on_text_delta(flush_text)
-
-    if thinking_as_text and text:
-        # Composer bundles reasoning + answer in one thinking field; keep only
-        # the final answer as text and move the reasoning to the thinking channel.
-        answer, reasoning = _split_composer_final(text)
-        if reasoning:
-            text = answer
-            thinking = reasoning if not thinking else f"{reasoning}\n{thinking}"
 
     errors = [
         e for e in errors
@@ -629,7 +582,6 @@ async def _call_cursor_direct(
                     stream_iter,
                     on_text_delta=on_stream_delta,
                     on_thinking_delta=on_thinking_delta,
-                    thinking_as_text=_is_composer_model(current_model),
                 )
         except Exception as exc:
             err_msg = str(exc)
@@ -791,10 +743,7 @@ async def _call_cursor_direct(
                     auth_token, injected_base, current_model
                 )
                 async with open_streaming_h2_request(path_c, headers_c, body_c) as stream_c:
-                    consumed_c = await consume_stream(
-                        stream_c,
-                        thinking_as_text=_is_composer_model(current_model),
-                    )
+                    consumed_c = await consume_stream(stream_c)
             except Exception as exc_c:
                 logger.error(f"[{request_id}] Continuation retry stream error: {exc_c}")
                 break
