@@ -252,6 +252,19 @@ def test_processor_no_marker_surfaces_answer_not_blank():
     assert tools == []
 
 
+def test_processor_strips_second_control_token_in_answer():
+    # Live failure: reasoning</think> then a stray <｜final｜> before the answer,
+    # with the second marker split across chunks. It must not leak in fragments.
+    thinking, text, tools = _drive_processor(
+        ["a lot of reasoning</think>", "<｜", "final｜>", "\n我是 Claude Code"]
+    )
+    assert "a lot of reasoning" in thinking
+    assert "final" not in text
+    assert "<｜" not in text and "<|" not in text
+    assert text.strip() == "我是 Claude Code"
+    assert tools == []
+
+
 def test_processor_reasoning_then_tool_only_answer():
     thinking, text, tools = _drive_processor(
         ["reasoning here</think>", _ascii_block("Bash", ("command", "ls"))]

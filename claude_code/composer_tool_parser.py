@@ -91,6 +91,48 @@ def _find_control_token(value: str) -> tuple[int, int] | None:
     return (m.start(), len(m.group(0))) if m else None
 
 
+# Concrete control-token strings, for partial-prefix detection at chunk edges.
+_CONTROL_TOKEN_CANDIDATES = ("</think>", "<|final|>", "<｜final｜>", "< | final | >")
+
+
+def _control_token_prefix_len(value: str) -> int:
+    """Length of the longest trailing run of *value* that could be the start of
+    a control token (so it can be held back across streaming chunks)."""
+    max_len = min(len(value), max(len(c) for c in _CONTROL_TOKEN_CANDIDATES))
+    keep = 0
+    for length in range(1, max_len + 1):
+        suffix = value[len(value) - length:]
+        if any(c.startswith(suffix) for c in _CONTROL_TOKEN_CANDIDATES):
+            keep = length
+    return keep
+
+
+class _ControlTokenFilter:
+    """Streaming filter that removes complete ``</think>`` / ``<|final|>``
+    control tokens anywhere in the stream while holding back a trailing partial
+    token so one split across chunks is never emitted in fragments."""
+
+    __slots__ = ("_buffer",)
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    def push(self, delta: str) -> str:
+        self._buffer += delta
+        cleaned = strip_composer_control_tokens(self._buffer)
+        keep = _control_token_prefix_len(cleaned)
+        if keep == 0:
+            self._buffer = ""
+            return cleaned
+        self._buffer = cleaned[len(cleaned) - keep:]
+        return cleaned[: len(cleaned) - keep]
+
+    def flush(self) -> str:
+        cleaned = strip_composer_control_tokens(self._buffer)
+        self._buffer = ""
+        return cleaned
+
+
 def split_reasoning_and_answer(text: str) -> tuple[str, str]:
     """Split *text* into ``(reasoning, answer)`` on the last control token.
 
@@ -410,12 +452,14 @@ class ComposerStreamProcessor:
     clean prose *text* and parsed *tool_calls*.
     """
 
-    __slots__ = ("_phase", "_reason_buf", "_tool_filter")
+    __slots__ = ("_phase", "_reason_buf", "_tool_filter", "_control_filter", "_answer_started")
 
     def __init__(self) -> None:
         self._phase = "reasoning"
         self._reason_buf = ""
         self._tool_filter = ComposerToolCallFilter()
+        self._control_filter = _ControlTokenFilter()
+        self._answer_started = False
 
     def feed_thinking(self, delta: str) -> ComposerEmit:
         if self._phase != "reasoning":
@@ -439,16 +483,28 @@ class ComposerStreamProcessor:
         return self._feed_answer(delta)
 
     def _feed_answer(self, text: str) -> ComposerEmit:
+        # Strip any further control tokens (e.g. a stray <|final|> at the start
+        # of the answer) BEFORE the tool filter, which would otherwise fragment
+        # them across text events and leak the pieces.
+        cleaned_in = self._control_filter.push(text)
+        return self._drain_tool_events(self._tool_filter.push(cleaned_in))
+
+    def _drain_tool_events(self, events) -> ComposerEmit:
         text_parts: list[str] = []
         tool_calls: list[dict] = []
-        for kind, payload in self._tool_filter.push(text):
+        for kind, payload in events:
             if kind == "text":
-                cleaned = strip_composer_control_tokens(payload)  # type: ignore[arg-type]
-                if cleaned:
-                    text_parts.append(cleaned)
+                if payload:
+                    text_parts.append(payload)  # type: ignore[arg-type]
             else:
                 tool_calls.append(payload)  # type: ignore[arg-type]
-        return ComposerEmit("", "".join(text_parts), tool_calls)
+        text = "".join(text_parts)
+        if not self._answer_started:
+            # Drop leading whitespace left behind after the control token(s).
+            text = text.lstrip()
+            if text:
+                self._answer_started = True
+        return ComposerEmit("", text, tool_calls)
 
     def flush(self) -> ComposerEmit:
         text_parts: list[str] = []
@@ -464,11 +520,12 @@ class ComposerStreamProcessor:
             self._reason_buf = ""
             self._phase = "answer"
 
-        for kind, payload in self._tool_filter.flush():
-            if kind == "text":
-                cleaned = strip_composer_control_tokens(payload)  # type: ignore[arg-type]
-                if cleaned:
-                    text_parts.append(cleaned)
-            else:
-                tool_calls.append(payload)  # type: ignore[arg-type]
+        # Flush the control filter through the tool filter, then drain both.
+        residual = self._control_filter.flush()
+        if residual:
+            self._tool_filter.push(residual)
+        final = self._drain_tool_events(self._tool_filter.flush())
+        if final.text:
+            text_parts.append(final.text)
+        tool_calls.extend(final.tool_calls)
         return ComposerEmit("", "".join(text_parts), tool_calls)
