@@ -37,7 +37,8 @@ from core.protobuf_frame_parser import CURSOR_ABORT_ERROR_CODE, ProtobufFramePar
 from core.cursor_h2_client import open_streaming_h2_request
 from claude_code.tool_prompt_builder import inject_tool_prompt_into_messages, _merge_consecutive_same_role
 from config.system_prompt import THALAMUS_INSTRUCTION_SUPPLEMENT
-from claude_code.tool_parser import try_parse_tool_calls_from_text
+from claude_code.tool_parser import try_parse_tool_calls_from_text, normalize_tool_calls
+from claude_code.composer_tool_parser import ComposerStreamProcessor, is_composer_model
 from claude_code.tool_lazy_loader import (
     is_task_complete_call,
     extract_task_complete_result,
@@ -431,6 +432,7 @@ async def consume_stream(
     stream_iterator: AsyncIterator[bytes],
     on_text_delta: Callable[[str], Any] | None = None,
     on_thinking_delta: Callable[[str], Any] | None = None,
+    composer: bool = False,
 ) -> dict:
     """Consume a Cursor protobuf stream, accumulating text/thinking/errors.
 
@@ -440,9 +442,17 @@ async def consume_stream(
     Models that embed <think>...</think> in the text field (instead of the
     protobuf thinking field) are handled transparently: the tags are stripped
     and the content is routed to on_thinking_delta.
+
+    When ``composer`` is True the model is a Composer-2.x model, which streams
+    its whole output (reasoning + answer + DeepSeek-style tool tokens) through
+    the thinking field.  That stream is routed through a ComposerStreamProcessor
+    that separates reasoning (→thinking), clean answer prose (→text), and tool
+    calls (returned as ``composer_tool_calls``).
     """
     parser = ProtobufFrameParser()
     splitter = _ThinkTagSplitter()
+    composer_proc = ComposerStreamProcessor() if composer else None
+    composer_tool_calls: list[dict] = []
     text = ""
     thinking = ""
     errors: list[Any] = []
@@ -453,6 +463,24 @@ async def consume_stream(
     thinking_delta_count = 0
     stream_start = time.monotonic()
     first_chunk_latency_ms: float | None = None
+
+    def _apply_composer_emit(emit) -> None:
+        nonlocal text, thinking, had_content, text_delta_count, thinking_delta_count
+        if emit.thinking:
+            thinking += emit.thinking
+            thinking_delta_count += 1
+            had_content = True
+            if on_thinking_delta:
+                on_thinking_delta(emit.thinking)
+        if emit.text:
+            text += emit.text
+            text_delta_count += 1
+            had_content = True
+            if on_text_delta:
+                on_text_delta(emit.text)
+        if emit.tool_calls:
+            composer_tool_calls.extend(emit.tool_calls)
+            had_content = True
 
     async for chunk in stream_iterator:
         chunk_count += 1
@@ -471,6 +499,13 @@ async def consume_stream(
             for err in result.errors:
                 if _is_fatal_stream_error(err):
                     has_fatal_error = True
+
+        if composer_proc is not None:
+            if result.thinking:
+                _apply_composer_emit(composer_proc.feed_thinking(result.thinking))
+            if result.text:
+                _apply_composer_emit(composer_proc.feed_content(result.text))
+            continue
 
         if result.thinking:
             thinking += result.thinking
@@ -497,6 +532,9 @@ async def consume_stream(
                     on_text_delta(text_part)
                 logger.debug(f"[consume] text so far ({len(text)} chars): ...{text[-200:]}")
 
+    if composer_proc is not None:
+        _apply_composer_emit(composer_proc.flush())
+
     flush_think, flush_text = splitter.flush()
     if flush_think:
         thinking += flush_think
@@ -519,6 +557,7 @@ async def consume_stream(
     return {
         "text": text,
         "thinking": thinking,
+        "composer_tool_calls": composer_tool_calls,
         "errors": errors,
         "had_content": had_content,
         "has_fatal_error": has_fatal_error,
@@ -567,6 +606,7 @@ async def _call_cursor_direct(
         )
 
         attempt_start = time.monotonic()
+        is_composer = is_composer_model(current_model)
 
         req_payload_path = log_llm_request(
             request_id, current_model, injected_base,
@@ -582,6 +622,7 @@ async def _call_cursor_direct(
                     stream_iter,
                     on_text_delta=on_stream_delta,
                     on_thinking_delta=on_thinking_delta,
+                    composer=is_composer,
                 )
         except Exception as exc:
             err_msg = str(exc)
@@ -648,13 +689,18 @@ async def _call_cursor_direct(
 
         converted_tcs: list[dict] = []
         if all_valid_names:
-            parsed_tcs = try_parse_tool_calls_from_text(consumed["text"])
+            # Composer emits tool calls as DeepSeek text tokens (parsed from the
+            # thinking stream into composer_tool_calls), not Anthropic JSON.
+            if is_composer:
+                parsed_tcs = normalize_tool_calls(consumed.get("composer_tool_calls") or [])
+            else:
+                parsed_tcs = try_parse_tool_calls_from_text(consumed["text"])
             if parsed_tcs:
                 result = post_process_tool_calls(parsed_tcs, all_valid_names)
                 converted_tcs = result.get("processed") or []
                 if converted_tcs:
                     converted_tcs = _fix_garbled_paths_in_tool_calls(converted_tcs)
-                logger.info(f"[{request_id}] Text-parsed tool calls: {len(converted_tcs)}")
+                logger.info(f"[{request_id}] Parsed tool calls: {len(converted_tcs)} (composer={is_composer})")
 
         res_payload_path = log_llm_response(
             request_id, current_model, consumed["text"],
@@ -743,7 +789,7 @@ async def _call_cursor_direct(
                     auth_token, injected_base, current_model
                 )
                 async with open_streaming_h2_request(path_c, headers_c, body_c) as stream_c:
-                    consumed_c = await consume_stream(stream_c)
+                    consumed_c = await consume_stream(stream_c, composer=is_composer)
             except Exception as exc_c:
                 logger.error(f"[{request_id}] Continuation retry stream error: {exc_c}")
                 break
@@ -756,7 +802,10 @@ async def _call_cursor_direct(
             logger.info(f"[{request_id}] Continuation retry response | text_len={len(retry_text)}")
 
             retry_tcs: list[dict] = []
-            parsed_retry = try_parse_tool_calls_from_text(retry_text)
+            if is_composer:
+                parsed_retry = normalize_tool_calls(consumed_c.get("composer_tool_calls") or [])
+            else:
+                parsed_retry = try_parse_tool_calls_from_text(retry_text)
             if parsed_retry:
                 result_retry = post_process_tool_calls(parsed_retry, all_valid_names)
                 retry_tcs = result_retry.get("processed") or []
