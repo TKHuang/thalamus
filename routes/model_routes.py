@@ -5,6 +5,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from config.cursor_client import get_cursor_client_version
 from core.bearer_token import extract_bearer_tokens, strip_cursor_user_prefix
 from core.cursor_h2_client import send_unary_h2_request
 from core.protobuf_builder import generate_obfuscated_machine_id_checksum
@@ -15,7 +16,7 @@ from utils.structured_logging import ThalamusStructuredLogger
 logger = ThalamusStructuredLogger.get_logger("model-routes", "DEBUG")
 router = APIRouter()
 
-CURSOR_CLIENT_VERSION = "2.5.25"
+CURSOR_CLIENT_VERSION = get_cursor_client_version()
 
 
 async def _fetch_available_models(token: str) -> list[dict]:

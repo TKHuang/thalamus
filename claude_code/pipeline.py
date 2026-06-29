@@ -54,6 +54,7 @@ from claude_code.openai_sse_assembler import (
 )
 from config.tool_registry import post_process_tool_calls
 from config.fallback_config import load_fallback_config
+from config.cursor_client import get_cursor_client_version
 
 logger = ThalamusStructuredLogger.get_logger("pipeline", "DEBUG")
 
@@ -339,7 +340,7 @@ def build_cursor_stream_params(
     checksum = generate_obfuscated_machine_id_checksum(chosen_auth.strip())
     session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chosen_auth))
     client_key = compute_sha256_hex_digest(chosen_auth)
-    client_version = os.environ.get("CURSOR_CLIENT_VERSION", "2.5.25")
+    client_version = get_cursor_client_version()
 
     body = build_gzip_framed_protobuf_chat_request_body(
         messages, model, agent_mode=True

@@ -11,20 +11,20 @@ Port of: cursor_pkce_login_and_access_token_polling_client.js
 """
 
 import hashlib
-import os
 import secrets
 import uuid
 from base64 import urlsafe_b64encode
 
 import httpx
 
+from config.cursor_client import get_cursor_client_version
 from utils.structured_logging import ThalamusStructuredLogger
 
 logger = ThalamusStructuredLogger.get_logger("pkce-login", "DEBUG")
 
 CURSOR_LOGIN_BASE = "https://www.cursor.com/loginDeepControl"
 CURSOR_AUTH_POLL_URL = "https://api2.cursor.sh/auth/poll"
-CURSOR_CLIENT_VERSION = os.environ.get("CURSOR_CLIENT_VERSION", "2.5.25")
+CURSOR_CLIENT_VERSION = get_cursor_client_version()
 
 
 def generate_pkce_verifier_and_challenge() -> tuple[str, str]:
