@@ -63,13 +63,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif self.path == "/api/login":
             c, b = proxy_get("/cursor/login")
-            self._json(c, b)
+            # Open the OAuth URL in the system browser and tell the UI whether it
+            # worked, so a missing default browser (more common on Windows) shows
+            # a "click to open" fallback instead of silently spinning the poll.
             try:
                 d = json.loads(b)
                 if d.get("url"):
-                    webbrowser.open(d["url"])
+                    d["browser_opened"] = bool(webbrowser.open(d["url"]))
+                    b = json.dumps(d).encode()
             except Exception:
                 pass
+            self._json(c, b)
 
         elif self.path.startswith("/api/poll"):
             qs = self.path.split("?", 1)[1] if "?" in self.path else ""

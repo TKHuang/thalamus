@@ -19,7 +19,8 @@ import os
 import sys
 import atexit
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
+
+from core.paths import log_base_dir
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -185,7 +186,7 @@ class StructuredLogWriter:
 
 class ThalamusStructuredLogger:
     _loggers: dict[str, StructuredLogWriter] = {}
-    _log_base_dir = str(Path(__file__).resolve().parent.parent / "logs")
+    _log_base_dir = str(log_base_dir())
     _session_start = _beijing_now()
     _session_dir: str | None = None
 

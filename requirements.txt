@@ -5,3 +5,5 @@ h2>=4.1.0
 protobuf>=5.27.0
 python-dotenv>=1.0.0
 pydantic>=2.7.0
+platformdirs>=4.0.0
+colorama>=0.4.6

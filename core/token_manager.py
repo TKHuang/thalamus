@@ -16,14 +16,17 @@ calls without the original request.
 import os
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 from urllib.parse import unquote
 
+from core.paths import token_env_path
 from utils.structured_logging import ThalamusStructuredLogger
 
 logger = ThalamusStructuredLogger.get_logger("token-manager", "DEBUG")
 
-ENV_FILE_PATH = Path(__file__).resolve().parent.parent / '.env'
+# Persisted in a platform-writable data dir (see core/paths). Loaded back at
+# startup by server.py via load_dotenv(override=True), so the read path and
+# this write path always resolve to the same file across macOS/Windows.
+ENV_FILE_PATH = token_env_path()
 
 _store: dict = {
     'token': '',
@@ -129,6 +132,7 @@ def capture_token_from_request(authorization_header: str | None) -> None:
 def _persist_to_dot_env(token: str) -> None:
     try:
         env_content = ''
+        ENV_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
         if ENV_FILE_PATH.exists():
             env_content = ENV_FILE_PATH.read_text(encoding='utf-8')
 

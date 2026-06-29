@@ -3,11 +3,26 @@ import os
 import sys
 from pathlib import Path
 
+from colorama import just_fix_windows_console
 from dotenv import load_dotenv
 
-env_path = Path(__file__).parent / ".env"
-if env_path.exists():
-    load_dotenv(env_path)
+from core.paths import token_env_path
+
+# Enable ANSI color sequences on legacy Windows consoles (cmd.exe / PowerShell);
+# no-op on macOS, Linux, and modern terminals.
+just_fix_windows_console()
+
+# Dev/local config from the repo-root .env (if present)...
+repo_env = Path(__file__).parent / ".env"
+if repo_env.exists():
+    load_dotenv(repo_env)
+
+# ...then let the persisted runtime token from the platform data dir override it,
+# so a captured token survives restarts even when the app is installed in a
+# read-only location (e.g. C:\Program Files). Mirrors core/token_manager.py.
+data_env = token_env_path()
+if data_env.exists():
+    load_dotenv(data_env, override=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,5 +86,6 @@ async def count_tokens():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "3013"))
-    logger.info(f"Starting thalamus-py on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    host = os.environ.get("THALAMUS_HOST", "127.0.0.1")
+    logger.info(f"Starting thalamus-py on {host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="info")
