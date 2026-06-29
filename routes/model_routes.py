@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from google.protobuf.unknown_fields import UnknownFieldSet
 
 from config.cursor_client import get_cursor_client_version
 from core.bearer_token import extract_bearer_tokens, strip_cursor_user_prefix
@@ -18,8 +19,29 @@ router = APIRouter()
 
 CURSOR_CLIENT_VERSION = get_cursor_client_version()
 
+# AvailableModel carries a repeated string of usable reasoning-effort variant
+# ids (e.g. "glm-5.2-high", "glm-5.2-max") in field 36. Our partial .proto only
+# defines name/defaultOn/..., so field 36 lands in the unknown-field set.
+_MODEL_VARIANT_FIELD = 36
 
-async def _fetch_available_models(token: str) -> list[dict]:
+
+def _extract_variant_model_ids(model) -> list[str]:
+    """Read Cursor's effort-suffixed variant ids (field 36) for a model.
+
+    Some models (e.g. glm-5.2) reject their bare name and are only usable via a
+    variant, so these must be surfaced in the model listing.
+    """
+    ids: list[str] = []
+    for field in UnknownFieldSet(model):
+        if field.field_number == _MODEL_VARIANT_FIELD and field.wire_type == 2:
+            try:
+                ids.append(field.data.decode("utf-8"))
+            except UnicodeDecodeError:
+                continue
+    return ids
+
+
+async def _fetch_available_models(token: str) -> list[str]:
     checksum = generate_obfuscated_machine_id_checksum(token.strip())
     headers = {
         "authorization": f"Bearer {token}",
@@ -49,15 +71,17 @@ async def _fetch_available_models(token: str) -> list[dict]:
     resp = pb.AvailableModelsResponse()
     resp.ParseFromString(result["buffer"])
 
-    models = []
+    # Emit the bare model name plus every effort-suffixed variant, deduped and
+    # order-preserved. Bare names are kept (most work as-is); variants make
+    # suffix-only models like glm-5.2 selectable.
+    model_ids: list[str] = []
+    seen: set[str] = set()
     for m in resp.models:
-        models.append({
-            "name": m.name,
-            "defaultOn": m.defaultOn,
-            "isLongContextOnly": getattr(m, "isLongContextOnly", False),
-            "isChatOnly": getattr(m, "isChatOnly", False),
-        })
-    return models
+        for model_id in [m.name, *_extract_variant_model_ids(m)]:
+            if model_id and model_id not in seen:
+                seen.add(model_id)
+                model_ids.append(model_id)
+    return model_ids
 
 
 @router.get("/v1/models")
@@ -74,18 +98,18 @@ async def list_models(request: Request):
         )
 
     try:
-        models = await _fetch_available_models(token)
-        logger.info(f"AvailableModels returned {len(models)} models")
+        model_ids = await _fetch_available_models(token)
+        logger.info(f"AvailableModels returned {len(model_ids)} models")
         return JSONResponse(content={
             "object": "list",
             "data": [
                 {
-                    "id": m["name"],
+                    "id": model_id,
                     "object": "model",
                     "created": 0,
                     "owned_by": "cursor",
                 }
-                for m in models
+                for model_id in model_ids
             ],
         })
     except Exception as exc:
