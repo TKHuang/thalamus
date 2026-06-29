@@ -1,0 +1,7 @@
+# Desktop shell + Windows build tooling.
+# These are NOT imported by the FastAPI server (server.py); they are only
+# needed to run/package the desktop shell (desktop-app/thalamus_app.py).
+#   pip install -r requirements.txt -r requirements-desktop.txt
+pywebview>=5.0
+Pillow>=10.0
+pyinstaller>=6.0

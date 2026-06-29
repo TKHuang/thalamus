@@ -19,5 +19,6 @@ _raw_cc_request.json
 reference/anthropic-adapters/
 desktop-app/dist/
 desktop-app/assets/*.icns
+desktop-app/assets/*.ico
 desktop-app/node_modules/
 desktop-app/.DS_Store

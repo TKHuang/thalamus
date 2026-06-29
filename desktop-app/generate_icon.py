@@ -1,12 +1,29 @@
-"""Generate macOS .icns icon for Thalamus.app"""
+"""Generate Thalamus app icons.
 
+Produces a portable base PNG (pure Python), then:
+  - assets/icon.ico   for the Windows build (Pillow, any platform)
+  - assets/icon.icns  for the macOS build (iconutil, macOS only)
+
+icon.icns is what desktop-app/build.sh bundles into Thalamus.app; icon.ico is
+what desktop-app/build.ps1 passes to PyInstaller. Run directly:
+
+    python generate_icon.py
+"""
+
+import io
 import struct
 import zlib
 import subprocess
 import shutil
+import sys
 from pathlib import Path
 
+from PIL import Image
+
 ASSETS = Path(__file__).parent / "assets"
+
+ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+ICNS_SIZES = [16, 32, 64, 128, 256, 512]
 
 
 def make_png(w, h, pixels):
@@ -61,40 +78,44 @@ def generate_icon_png(size=1024):
     return make_png(W, H, pixels)
 
 
-def main():
-    ASSETS.mkdir(exist_ok=True)
-    png_1024 = ASSETS / "icon_1024.png"
+def _base_image() -> Image.Image:
+    """The 1024px master icon as a Pillow RGBA image."""
+    return Image.open(io.BytesIO(generate_icon_png(1024))).convert("RGBA")
 
-    with open(png_1024, "wb") as f:
-        f.write(generate_icon_png(1024))
-    print("Generated 1024x1024 PNG")
 
+def write_ico(base: Image.Image) -> Path:
+    """Windows multi-resolution .ico (works on any platform)."""
+    out = ASSETS / "icon.ico"
+    base.save(out, format="ICO", sizes=ICO_SIZES)
+    return out
+
+
+def write_icns(base: Image.Image) -> Path:
+    """macOS .icns: build the .iconset with Pillow, assemble with iconutil."""
     iconset = ASSETS / "icon.iconset"
     iconset.mkdir(exist_ok=True)
+    try:
+        for size in ICNS_SIZES:
+            base.resize((size, size), Image.LANCZOS).save(iconset / f"icon_{size}x{size}.png")
+            double = size * 2
+            base.resize((double, double), Image.LANCZOS).save(iconset / f"icon_{size}x{size}@2x.png")
+        out = ASSETS / "icon.icns"
+        subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(out)], check=True)
+        return out
+    finally:
+        shutil.rmtree(iconset, ignore_errors=True)
 
-    for size in [16, 32, 64, 128, 256, 512]:
-        subprocess.run(
-            ["sips", "-z", str(size), str(size), str(png_1024),
-             "--out", str(iconset / f"icon_{size}x{size}.png")],
-            capture_output=True,
-        )
-        double = size * 2
-        subprocess.run(
-            ["sips", "-z", str(double), str(double), str(png_1024),
-             "--out", str(iconset / f"icon_{size}x{size}@2x.png")],
-            capture_output=True,
-        )
 
-    shutil.copy2(png_1024, iconset / "icon_512x512@2x.png")
+def main():
+    ASSETS.mkdir(exist_ok=True)
+    base = _base_image()
 
-    subprocess.run(
-        ["iconutil", "-c", "icns", str(iconset), "-o", str(ASSETS / "icon.icns")],
-        check=True,
-    )
+    print(f"Generated {write_ico(base)}")
 
-    shutil.rmtree(iconset)
-    png_1024.unlink()
-    print(f"Generated {ASSETS / 'icon.icns'}")
+    if sys.platform == "darwin" and shutil.which("iconutil"):
+        print(f"Generated {write_icns(base)}")
+    else:
+        print("Skipped icon.icns (macOS/iconutil only; not needed for the Windows build)")
 
 
 if __name__ == "__main__":
