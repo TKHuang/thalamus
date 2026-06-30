@@ -18,6 +18,8 @@ logs/
 _raw_cc_request.json
 reference/anthropic-adapters/
 desktop-app/dist/
+desktop-app/dist-nuitka/
+desktop-app/*.spec
 desktop-app/assets/*.icns
 desktop-app/assets/*.ico
 desktop-app/node_modules/

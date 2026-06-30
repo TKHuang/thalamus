@@ -1,27 +1,37 @@
 <#
 .SYNOPSIS
-    Build the Thalamus Windows desktop app (pywebview + PyInstaller).
+    Build a self-contained, single-file Thalamus.exe with PyInstaller.
 
 .DESCRIPTION
-    Windows counterpart of build.sh. Produces dist\Thalamus\Thalamus.exe — a
-    thin shell (desktop-app/thalamus_app.py) that launches the FastAPI backend
-    (server.py) and the UI proxy (launcher_ui.py) from the repo's .venv and
-    shows the UI in a WebView2 window.
+    Produces ONE portable executable — dist\Thalamus-PyInstaller.exe — with the
+    Python runtime, the FastAPI backend (server.py + core/routes/config/...),
+    pywebview/WebView2, and every dependency baked in. No _internal folder, no
+    .venv, no thalamus_path.conf: copy the single .exe anywhere and run it.
 
-    Like build.sh, the backend itself is NOT frozen into the exe: server.py runs
-    from the repo using the repo's .venv, located at runtime via the
-    thalamus_path.conf written next to the exe by this script.
+    This is the most popular packager and the smoothest path for pywebview.
+    Trade-off vs. Nuitka (build_nuitka.ps1): --onefile unpacks to %TEMP% on each
+    launch, so cold start is ~1-3s slower, and an UNSIGNED onefile is the classic
+    Defender/SmartScreen false-positive magnet. The durable fix for both AV and
+    trust prompts is Authenticode code-signing the finished .exe.
 
 .NOTES
-    Run on Windows 10/11 with Python 3.11+ on PATH (the `py` launcher) and the
-    WebView2 runtime present (it ships with Windows 11 and Chromium Edge).
+    Windows 10/11, Python 3.11+ on PATH (the `py` launcher), WebView2 runtime
+    present (ships with Windows 11 and Chromium Edge).
+
         powershell -ExecutionPolicy Bypass -File desktop-app\build.ps1
+        powershell -ExecutionPolicy Bypass -File desktop-app\build.ps1 -Console
 
 .PARAMETER ThalamusPath
-    Repo root to bake into thalamus_path.conf. Defaults to the parent of this
-    script. Override when the exe will run against a repo at a different path.
+    Repo root. Defaults to the parent of this script.
+
+.PARAMETER Console
+    Build a console exe (keeps a terminal window) so Python tracebacks are
+    visible while debugging. Omit for the windowed product build.
 #>
-param([string]$ThalamusPath)
+param(
+    [string]$ThalamusPath,
+    [switch]$Console
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -32,12 +42,13 @@ $RepoDir = if ($ThalamusPath) {
 } else {
     (Resolve-Path (Join-Path $ScriptDir "..")).Path
 }
-$AppName = "Thalamus"
+$AppName = "Thalamus-PyInstaller"
 
 Write-Host "========================================="
-Write-Host "  Thalamus Windows .exe builder (pywebview)"
+Write-Host "  Thalamus single-file build (PyInstaller)"
+Write-Host "  repo:    $RepoDir"
+Write-Host "  console: $($Console.IsPresent)"
 Write-Host "========================================="
-Write-Host "  repo: $RepoDir"
 
 # 1. Locate (or create) the repo's virtualenv
 $VenvPy = Join-Path $RepoDir ".venv\Scripts\python.exe"
@@ -59,41 +70,64 @@ if (-not (Test-Path $IconIco)) {
     & $VenvPy (Join-Path $ScriptDir "generate_icon.py")
 }
 
-# 4. Bundle the shell with PyInstaller.
-#    --onedir (not --onefile): --onefile unpacks to %TEMP% on every launch and
-#    reliably trips Windows Defender's self-extraction heuristic.
-#    --collect-all webview: pull in pywebview's WebView2 backend + data files.
+# 4. Freeze the WHOLE app into one file.
+#    --paths $RepoDir          : resolve `import server` and the local packages.
+#    --collect-all <pkg>       : pull dynamically/lazily imported deps PyInstaller's
+#                                static analysis misses (uvicorn's auto loop/protocol
+#                                modules; h2/hpack/hyperframe behind httpx[http2];
+#                                certifi's CA bundle; pydantic_core; webview's
+#                                WebView2 backend).
+#    --hidden-import clr / webview.platforms.winforms + --collect-all pythonnet,
+#    clr_loader: pywebview opens its Windows window through WebView2 via pythonnet
+#    (the `clr` module), loaded dynamically — without these the frozen exe crashes
+#    on launch with "Unhandled exception in script". This is THE fix that made the
+#    single-file build run.
+#    --collect-submodules <pkg>: insurance for the app's own packages.
+$pyiArgs = @(
+    "-m", "PyInstaller",
+    "--noconfirm", "--clean", "--onefile",
+    "--name", $AppName,
+    "--icon", "assets\icon.ico",
+    "--paths", $RepoDir,
+    "--add-data", "index.html;.",
+    "--collect-all", "webview",
+    "--collect-all", "pythonnet",
+    "--collect-all", "clr_loader",
+    "--collect-all", "uvicorn",
+    "--collect-all", "httpx",
+    "--collect-all", "httpcore",
+    "--collect-all", "h2",
+    "--collect-all", "hpack",
+    "--collect-all", "hyperframe",
+    "--collect-all", "anyio",
+    "--collect-all", "certifi",
+    "--collect-all", "pydantic",
+    "--collect-all", "pydantic_core",
+    "--collect-all", "google.protobuf",
+    "--hidden-import", "clr",
+    "--hidden-import", "webview.platforms.winforms",
+    "--collect-submodules", "routes",
+    "--collect-submodules", "core",
+    "--collect-submodules", "config",
+    "--collect-submodules", "claude_code",
+    "--collect-submodules", "proto",
+    "--collect-submodules", "utils"
+)
+if (-not $Console) { $pyiArgs += "--windowed" }
+$pyiArgs += "thalamus_app.py"
+
 Write-Host "Running PyInstaller ..."
 Push-Location $ScriptDir
 try {
-    & $VenvPy -m PyInstaller `
-        --noconfirm `
-        --clean `
-        --windowed `
-        --onedir `
-        --name $AppName `
-        --icon "assets\icon.ico" `
-        --collect-all webview `
-        --add-data "launcher_ui.py;." `
-        --add-data "index.html;." `
-        "thalamus_app.py"
+    & $VenvPy @pyiArgs
 } finally {
     Pop-Location
 }
 
-# 5. Write thalamus_path.conf next to the exe (UTF-8, no BOM) so the shell can
-#    find the repo + its .venv at runtime.
-$DistDir = Join-Path $ScriptDir "dist\$AppName"
-$ConfPath = Join-Path $DistDir "thalamus_path.conf"
-[System.IO.File]::WriteAllText($ConfPath, $RepoDir, [System.Text.UTF8Encoding]::new($false))
-
+$ExePath = Join-Path $ScriptDir "dist\$AppName.exe"
 Write-Host ""
 Write-Host "========================================="
 Write-Host "  Build complete!"
-Write-Host ""
-Write-Host "  Output:  $DistDir\$AppName.exe"
-Write-Host "  Repo:    $RepoDir"
-Write-Host ""
-Write-Host "  Run:     & `"$DistDir\$AppName.exe`""
-Write-Host "  (Wrap dist\$AppName in an Inno Setup installer to distribute.)"
+Write-Host "  Output: $ExePath"
+Write-Host "  Single file — copy it anywhere and run. No _internal folder."
 Write-Host "========================================="
