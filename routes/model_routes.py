@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+from decimal import Decimal, InvalidOperation
 from uuid import NAMESPACE_DNS, uuid4, uuid5
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from google.protobuf.empty_pb2 import Empty
+from google.protobuf.message import DecodeError
 from google.protobuf.unknown_fields import UnknownFieldSet
 
 from config.cursor_client import get_cursor_client_version
 from core.bearer_token import extract_bearer_tokens, strip_cursor_user_prefix
 from core.cursor_h2_client import send_unary_h2_request
+from core.model_context import (
+    MODEL_CONTEXT_MARKER_RE,
+    add_context_marker,
+    replace_model_context_catalog,
+    strip_context_marker,
+)
 from core.protobuf_builder import (
     compute_sha256_hex_digest,
     generate_obfuscated_machine_id_checksum,
@@ -29,6 +39,21 @@ CURSOR_CLIENT_VERSION = get_cursor_client_version()
 # defines name/defaultOn/..., so field 36 lands in the unknown-field set.
 _MODEL_VARIANT_FIELD = 36
 
+# Cursor 3.11.x defines explicit numeric context limits in fields 15/16, but
+# the live service currently leaves those fields unset and publishes the same
+# information in TooltipData.markdown_content (field 7) instead.  Read both:
+# numeric fields win once Cursor starts populating them; the live tooltip keeps
+# current and future models dynamic without a locally-maintained model map.
+_MODEL_TOOLTIP_FIELD = 8
+_MODEL_TOOLTIP_FOR_MAX_MODE_FIELD = 20
+_MODEL_CONTEXT_TOKEN_LIMIT_FIELD = 15
+_MODEL_CONTEXT_TOKEN_LIMIT_FOR_MAX_MODE_FIELD = 16
+_TOOLTIP_MARKDOWN_FIELD = 7
+_CONTEXT_WINDOW_RE = re.compile(
+    r"\b(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>[kmg])"
+    r"(?:\s+token)?\s+context\s+window\b",
+    re.IGNORECASE,
+)
 # The model listing proxies a live Cursor RPC that intermittently returns 401
 # (ERROR_NOT_LOGGED_IN) and pays a fresh TLS/H2 handshake on every call. Clients
 # such as Hermes fetch /v1/models to populate their model picker and fall back
@@ -39,7 +64,7 @@ _MODEL_CACHE_TTL_SECONDS = 300.0
 _AVAILABLE_MODELS_MAX_ATTEMPTS = 3
 _AVAILABLE_MODELS_RETRY_BACKOFF_SECONDS = 0.3
 
-_model_cache: dict = {"ids": [], "fetched_at": 0.0}
+_model_cache: dict = {"ids": [], "metadata": {}, "fetched_at": 0.0}
 _fetch_lock = asyncio.Lock()
 
 
@@ -50,6 +75,13 @@ def _extract_variant_model_ids(model) -> list[str]:
     variant, so these must be surfaced in the model listing.
     """
     ids: list[str] = []
+    # Prefer named fields if cursor_api.proto is updated later.
+    for attr in ("legacySlugs", "legacy_slugs"):
+        values = getattr(model, attr, None)
+        if values:
+            ids.extend(value for value in values if value)
+            return ids
+
     for field in UnknownFieldSet(model):
         if field.field_number == _MODEL_VARIANT_FIELD and field.wire_type == 2:
             try:
@@ -57,6 +89,103 @@ def _extract_variant_model_ids(model) -> list[str]:
             except UnicodeDecodeError:
                 continue
     return ids
+
+
+def _scaled_token_count(amount: str, unit: str) -> int | None:
+    multipliers = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
+    try:
+        value = int(Decimal(amount) * multipliers[unit.lower()])
+    except (InvalidOperation, KeyError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _context_length_from_text(text: str) -> int | None:
+    match = _CONTEXT_WINDOW_RE.search(text)
+    if match is None:
+        return None
+    return _scaled_token_count(match.group("amount"), match.group("unit"))
+
+
+def _known_numeric_field(model, attrs: tuple[str, ...]) -> int | None:
+    for attr in attrs:
+        value = getattr(model, attr, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def _unknown_varint_field(model, field_number: int) -> int | None:
+    for field in UnknownFieldSet(model):
+        if field.field_number == field_number and field.wire_type == 0 and field.data > 0:
+            return int(field.data)
+    return None
+
+
+def _known_tooltip_context(model, attrs: tuple[str, ...]) -> int | None:
+    for attr in attrs:
+        tooltip = getattr(model, attr, None)
+        if tooltip is None:
+            continue
+        markdown = getattr(tooltip, "markdownContent", None)
+        if markdown is None:
+            markdown = getattr(tooltip, "markdown_content", "")
+        context_length = _context_length_from_text(markdown or "")
+        if context_length is not None:
+            return context_length
+    return None
+
+
+def _unknown_tooltip_context(model, field_number: int) -> int | None:
+    """Decode TooltipData.markdown_content while our checked-in proto is partial."""
+    for field in UnknownFieldSet(model):
+        if field.field_number != field_number or field.wire_type != 2:
+            continue
+        tooltip = Empty()
+        try:
+            tooltip.ParseFromString(field.data)
+        except DecodeError:
+            continue
+        for nested in UnknownFieldSet(tooltip):
+            if nested.field_number != _TOOLTIP_MARKDOWN_FIELD or nested.wire_type != 2:
+                continue
+            try:
+                markdown = nested.data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            context_length = _context_length_from_text(markdown)
+            if context_length is not None:
+                return context_length
+    return None
+
+
+def _extract_model_context_metadata(model) -> dict[str, int]:
+    """Extract live context limits from Cursor's AvailableModel metadata."""
+    context_length = (
+        _known_numeric_field(model, ("contextTokenLimit", "context_token_limit"))
+        or _unknown_varint_field(model, _MODEL_CONTEXT_TOKEN_LIMIT_FIELD)
+        or _known_tooltip_context(model, ("tooltipData", "tooltip_data"))
+        or _unknown_tooltip_context(model, _MODEL_TOOLTIP_FIELD)
+    )
+    max_context_length = (
+        _known_numeric_field(
+            model,
+            ("contextTokenLimitForMaxMode", "context_token_limit_for_max_mode"),
+        )
+        or _unknown_varint_field(model, _MODEL_CONTEXT_TOKEN_LIMIT_FOR_MAX_MODE_FIELD)
+        or _known_tooltip_context(
+            model,
+            ("tooltipDataForMaxMode", "tooltip_data_for_max_mode"),
+        )
+        or _unknown_tooltip_context(model, _MODEL_TOOLTIP_FOR_MAX_MODE_FIELD)
+    )
+
+    metadata: dict[str, int] = {}
+    if context_length is not None:
+        metadata["context_length"] = context_length
+    if max_context_length is not None:
+        metadata["max_context_length"] = max_context_length
+    return metadata
 
 
 def _collect_model_ids(resp) -> list[str]:
@@ -75,7 +204,41 @@ def _collect_model_ids(resp) -> list[str]:
     return model_ids
 
 
-async def _fetch_available_models(token: str) -> list[str]:
+def _collect_model_catalog(resp) -> tuple[list[str], dict[str, dict[str, int]]]:
+    """Collect model ids plus metadata supplied by the same Cursor response."""
+    model_ids: list[str] = []
+    metadata: dict[str, dict[str, int]] = {}
+    seen: set[str] = set()
+    for model in resp.models:
+        model_metadata = _extract_model_context_metadata(model)
+        for model_id in [model.name, *_extract_variant_model_ids(model)]:
+            if not model_id:
+                continue
+            if model_id not in seen:
+                seen.add(model_id)
+                model_ids.append(model_id)
+            if model_metadata:
+                metadata[model_id] = dict(model_metadata)
+            normal = model_metadata.get("context_length")
+            maximum = model_metadata.get("max_context_length")
+            if normal is None or maximum is None or normal == maximum:
+                continue
+            max_model_id = add_context_marker(model_id, maximum)
+            if max_model_id is None:
+                continue
+            if max_model_id not in seen:
+                seen.add(max_model_id)
+                model_ids.append(max_model_id)
+            metadata[max_model_id] = {
+                "context_length": maximum,
+                "max_context_length": maximum,
+            }
+    return model_ids, metadata
+
+
+async def _fetch_available_models(
+    token: str,
+) -> tuple[list[str], dict[str, dict[str, int]]]:
     chosen_auth = token.strip()
     checksum = generate_obfuscated_machine_id_checksum(chosen_auth)
     # Match the streaming chat path's header signature (x-client-key /
@@ -106,7 +269,7 @@ async def _fetch_available_models(token: str) -> list[str]:
         if result["status"] == 200:
             resp = pb.AvailableModelsResponse()
             resp.ParseFromString(result["buffer"])
-            return _collect_model_ids(resp)
+            return _collect_model_catalog(resp)
 
         last_status, last_buffer = result["status"], result["buffer"]
         logger.warn(
@@ -121,13 +284,39 @@ async def _fetch_available_models(token: str) -> list[str]:
     )
 
 
+def _model_listing_metadata(model_id: str) -> dict[str, int]:
+    """Return live Cursor metadata, including a max-context marker if requested."""
+    marker = MODEL_CONTEXT_MARKER_RE.search(model_id)
+    base_model_id = strip_context_marker(model_id)
+    cached = _model_cache["metadata"].get(model_id)
+    if cached is None:
+        cached = _model_cache["metadata"].get(base_model_id)
+    if cached is None:
+        return {}
+
+    if marker is not None and "max_context_length" in cached:
+        marker_length = _scaled_token_count(marker.group("amount"), marker.group("unit"))
+        if marker_length == cached["max_context_length"]:
+            return {"context_length": marker_length}
+    if "context_length" in cached:
+        return {"context_length": cached["context_length"]}
+    return {}
+
+
+def _model_listing_object(model_id: str) -> dict:
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "cursor",
+        **_model_listing_metadata(model_id),
+    }
+
+
 def _models_response(model_ids: list[str]) -> JSONResponse:
     return JSONResponse(content={
         "object": "list",
-        "data": [
-            {"id": model_id, "object": "model", "created": 0, "owned_by": "cursor"}
-            for model_id in model_ids
-        ],
+        "data": [_model_listing_object(model_id) for model_id in model_ids],
     })
 
 
@@ -145,7 +334,7 @@ async def _list_model_ids(token: str) -> list[str]:
             return _model_cache["ids"]
 
         try:
-            model_ids = await _fetch_available_models(token)
+            model_ids, model_metadata = await _fetch_available_models(token)
         except Exception as exc:
             if _model_cache["ids"]:
                 logger.warn(
@@ -156,6 +345,8 @@ async def _list_model_ids(token: str) -> list[str]:
             raise
 
         _model_cache["ids"] = model_ids
+        _model_cache["metadata"] = model_metadata
+        replace_model_context_catalog(model_metadata)
         _model_cache["fetched_at"] = time.monotonic()
         logger.info(f"AvailableModels returned {len(model_ids)} models")
         return model_ids
@@ -200,6 +391,19 @@ async def list_models(request: Request):
         )
 
     return _models_response(model_ids)
+
+
+@router.get("/v1/models/{model_id}")
+async def get_model_detail(model_id: str):
+    """Return metadata only for models observed in the live Cursor catalog."""
+    observed_ids = _model_cache["ids"]
+    base_model_id = strip_context_marker(model_id)
+    if model_id not in observed_ids and base_model_id not in observed_ids:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": "Model not found", "type": "not_found_error"}},
+        )
+    return JSONResponse(content=_model_listing_object(model_id))
 
 
 @router.get("/models")

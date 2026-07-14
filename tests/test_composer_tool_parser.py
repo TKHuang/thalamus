@@ -5,6 +5,7 @@ under pytest.  Fixtures use the documented DeepSeek-style token grammar in both
 ASCII (``|`` / ``_``) and unicode (``｜`` U+FF5C / ``▁`` U+2581) forms.
 """
 
+import json
 import os
 import sys
 
@@ -19,6 +20,7 @@ from claude_code.composer_tool_parser import (  # noqa: E402
     split_reasoning_and_answer,
 )
 from claude_code.tool_parser import normalize_tool_calls  # noqa: E402
+from claude_code.tool_validation import validate_tool_candidates  # noqa: E402
 
 
 def _ascii_block(name: str, *kv: tuple[str, str]) -> str:
@@ -116,6 +118,26 @@ def test_parse_json_body_with_string_arguments_and_function_wrapper():
         "<|tool_call_end|><|tool_calls_end|>"
     )
     assert parse_composer_tool_calls(block) == [{"name": "Read", "arguments": {"file_path": "/a.py"}}]
+
+
+def test_json_body_preserves_invalid_arguments_for_strict_validation():
+    cases = (
+        (None, "arguments_not_object"),
+        ([], "arguments_not_object"),
+        (False, "arguments_not_object"),
+        (0, "arguments_not_object"),
+        ("{malformed", "arguments_invalid_json"),
+    )
+
+    for raw_arguments, expected_reason in cases:
+        body = json.dumps({"name": "Write", "arguments": raw_arguments})
+        block = f"<|tool_calls_begin|><|tool_call_begin|>{body}<|tool_call_end|><|tool_calls_end|>"
+        call = parse_composer_tool_calls(block)[0]
+        validation = validate_tool_candidates([call], allowed_names={"Write"})
+
+        assert call["arguments"] == raw_arguments
+        assert validation.accepted == ()
+        assert validation.rejected[0].reason == expected_reason
 
 
 def test_parse_inline_body():

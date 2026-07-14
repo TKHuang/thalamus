@@ -246,6 +246,7 @@ def normalize_tool_calls(tool_calls: list) -> list[dict]:
                     "name": tool_name,
                     "arguments": serialize_tool_arguments(raw_args),
                 },
+                "_validation_arguments": raw_args,
             }
         )
     return result
@@ -720,7 +721,7 @@ def parse_anthropic_tool_use_blocks(text: str) -> list[dict] | None:
         name = obj.get("name", "")
         if not isinstance(name, str) or not name.strip():
             continue
-        raw_input = obj.get("input") or {}
+        raw_input = obj.get("input") if "input" in obj else None
         results.append({
             "id": obj.get("id") or f"call_{uuid.uuid4().hex[:12]}",
             "type": "function",
@@ -728,6 +729,7 @@ def parse_anthropic_tool_use_blocks(text: str) -> list[dict] | None:
                 "name": name,
                 "arguments": json.dumps(raw_input) if not isinstance(raw_input, str) else raw_input,
             },
+            "_validation_arguments": raw_input,
         })
 
     return results if results else None

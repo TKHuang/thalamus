@@ -6,6 +6,7 @@ Every field CC sends is preserved — nothing is silently dropped.
 """
 
 import json
+import re
 from typing import Any
 
 from utils.structured_logging import ThalamusStructuredLogger
@@ -43,27 +44,6 @@ def _remove_uri_format(schema: Any) -> Any:
 
 _CLAUDE_FALLBACK = "claude-4.5-haiku"
 
-_CURSOR_CLAUDE_MODELS = {
-    "claude-4.6-sonnet-medium",
-    "claude-4.6-sonnet-medium-thinking",
-    "claude-4.6-opus-high",
-    "claude-4.6-opus-max",
-    "claude-4.6-opus-high-thinking",
-    "claude-4.6-opus-high-thinking-fast",
-    "claude-4.6-opus-max-thinking",
-    "claude-4.6-opus-max-thinking-fast",
-    "claude-4.5-opus-high",
-    "claude-4.5-opus-high-thinking",
-    "claude-4.5-haiku",
-    "claude-4.5-haiku-thinking",
-    "claude-4.5-sonnet",
-    "claude-4.5-sonnet-thinking",
-    "claude-4-sonnet",
-    "claude-4-sonnet-1m",
-    "claude-4-sonnet-thinking",
-    "claude-4-sonnet-1m-thinking",
-}
-
 _CC_TO_CURSOR_MODEL_MAP = {
     "default": "default",
     "inherit": _CLAUDE_FALLBACK,
@@ -76,8 +56,11 @@ _CC_TO_CURSOR_MODEL_MAP = {
 
 _CC_ANTHROPIC_TO_CURSOR = {
     "claude-sonnet-4": "claude-4-sonnet",
+    "claude-sonnet-4-5": "claude-4.5-sonnet",
     "claude-opus-4": "claude-4.5-opus-high",
+    "claude-opus-4-5": "claude-4.5-opus-high",
     "claude-haiku-4": "claude-4.5-haiku",
+    "claude-haiku-4-5": "claude-4.5-haiku",
     "claude-3-5-sonnet": "claude-4.5-sonnet",
     "claude-3-5-haiku": "claude-4.5-haiku",
     "claude-3-opus": "claude-4.5-opus-high",
@@ -85,22 +68,17 @@ _CC_ANTHROPIC_TO_CURSOR = {
 
 
 def resolve_model_name(model_name: str) -> str:
-    """Map CC external model names to Cursor-recognized names.
+    """Map only documented aliases and unambiguous Anthropic API IDs.
 
-    Priority:
-      1. Known Cursor claude model names → pass through directly
-      2. CC pseudo-names (sonnet/opus/haiku/inherit) → mapped
-      3. Anthropic API model IDs (claude-sonnet-4-20250514) → mapped via prefix
-      4. Other claude-* → fallback to claude-4.5-haiku
-      5. Non-claude models → pass through
+    Cursor-native and future ``claude-*`` IDs pass through unchanged. Cursor
+    decides whether those IDs are available instead of silently substituting a
+    different model.
     """
     if not model_name or not model_name.strip():
         return _CLAUDE_FALLBACK
 
-    lower = model_name.lower().strip()
-
-    if lower in _CURSOR_CLAUDE_MODELS:
-        return lower
+    normalized = model_name.strip()
+    lower = normalized.lower()
 
     if lower in _CC_TO_CURSOR_MODEL_MAP:
         resolved = _CC_TO_CURSOR_MODEL_MAP[lower]
@@ -108,15 +86,12 @@ def resolve_model_name(model_name: str) -> str:
             logger.info(f"Model '{model_name}' mapped to '{resolved}'")
         return resolved
 
-    if lower.startswith("claude"):
-        for prefix, cursor_model in _CC_ANTHROPIC_TO_CURSOR.items():
-            if lower.startswith(prefix):
-                logger.info(f"Model '{model_name}' matched prefix '{prefix}' → '{cursor_model}'")
-                return cursor_model
-        logger.info(f"Model '{model_name}' (claude-*) fallback → '{_CLAUDE_FALLBACK}'")
-        return _CLAUDE_FALLBACK
+    for api_model, cursor_model in _CC_ANTHROPIC_TO_CURSOR.items():
+        if lower == api_model or re.fullmatch(rf"{re.escape(api_model)}-\d{{8}}", lower):
+            logger.info(f"Model '{model_name}' mapped to '{cursor_model}'")
+            return cursor_model
 
-    return model_name
+    return normalized
 
 
 def _flatten_tool_result_content(content: Any) -> str:

@@ -44,6 +44,17 @@ class StreamingOpenAISession:
             }],
         ))
 
+    def emit_reasoning_delta(self, text: str) -> str:
+        """Emit one OpenAI-compatible reasoning fragment without visible content."""
+        self._total_text_len += len(text)
+        return _format_openai_sse(self._base_chunk(
+            choices=[{
+                "index": 0,
+                "delta": {"reasoning_content": text},
+                "finish_reason": None,
+            }],
+        ))
+
     def emit_text_delta(self, text: str) -> str:
         self._has_content = True
         self._total_text_len += len(text)

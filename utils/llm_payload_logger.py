@@ -2,7 +2,7 @@ from __future__ import annotations
 """
 LLM API payload logger.
 
-Every Cursor API call gets:
+When THALAMUS_RAW_PAYLOAD_LOGGING=true, Cursor API calls get:
   1. A request payload file:  logs/<session>/<date>/pipeline/payloads/req_<id>_request.json
   2. A response payload file: logs/<session>/<date>/pipeline/payloads/req_<id>_response.json
   3. A one-line entry in:     logs/<session>/<date>/pipeline/llm-api-calls.log
@@ -15,6 +15,7 @@ import json
 import os
 from datetime import datetime, timezone, timedelta
 
+from utils.raw_payload_logging import is_raw_payload_logging_enabled
 from utils.structured_logging import ThalamusStructuredLogger
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -70,7 +71,9 @@ def log_llm_request(
     messages: list[dict],
     extra: dict | None = None,
 ) -> str:
-    """Write request payload to file. Returns the absolute path of the payload file."""
+    """Write request payload to file when raw payload logging is enabled."""
+    if not is_raw_payload_logging_enabled():
+        return ""
     payload_dir = _payload_dir()
     filename = f"{request_id}_request.json"
     filepath = os.path.join(payload_dir, filename)
@@ -98,7 +101,9 @@ def log_llm_response(
     latency_ms: int | None = None,
     extra: dict | None = None,
 ) -> str:
-    """Write response payload to file. Returns the absolute path of the payload file."""
+    """Write response payload to file when raw payload logging is enabled."""
+    if not is_raw_payload_logging_enabled():
+        return ""
     payload_dir = _payload_dir()
     filename = f"{request_id}_response.json"
     filepath = os.path.join(payload_dir, filename)
@@ -129,7 +134,9 @@ def log_llm_api_call(
     response_payload_path: str,
     error: str | None = None,
 ):
-    """Append a single-line summary to the llm-api-calls.log referencing payload files."""
+    """Append raw payload-file references when raw payload logging is enabled."""
+    if not is_raw_payload_logging_enabled():
+        return
     ts = _beijing_timestamp()
     err_part = f" error={error}" if error else ""
     line = (

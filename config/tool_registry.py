@@ -78,24 +78,28 @@ def is_claude_code_request(tool_names: list | None) -> bool:
     return bool(tool_names and isinstance(tool_names, list) and len(tool_names) > 0)
 
 
-def normalize_tool_arguments_as_json_object(raw_arguments) -> tuple[bool, str]:
-    if raw_arguments is None:
-        return True, '{}'
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f'Non-standard JSON constant: {value}')
 
+
+def normalize_tool_arguments_as_json_object(raw_arguments) -> tuple[bool, str]:
     if isinstance(raw_arguments, str):
-        trimmed = raw_arguments.strip()
-        if not trimmed:
-            return True, '{}'
         try:
-            parsed = json.loads(trimmed)
-            if isinstance(parsed, dict):
-                return True, json.dumps(parsed)
-            return False, 'arguments_not_object'
+            parsed = json.loads(raw_arguments, parse_constant=_reject_json_constant)
         except (json.JSONDecodeError, ValueError):
             return False, 'arguments_invalid_json'
+        if isinstance(parsed, dict):
+            try:
+                return True, json.dumps(parsed, allow_nan=False)
+            except (TypeError, ValueError):
+                return False, 'arguments_invalid_json'
+        return False, 'arguments_not_object'
 
     if isinstance(raw_arguments, dict):
-        return True, json.dumps(raw_arguments)
+        try:
+            return True, json.dumps(raw_arguments, allow_nan=False)
+        except (TypeError, ValueError):
+            return False, 'arguments_invalid_json'
 
     return False, 'arguments_not_object'
 
@@ -121,21 +125,24 @@ def post_process_tool_calls(tool_calls: list | None, valid_names: list | None) -
         if was_fixed:
             stats['normalized'] += 1
 
-        exact_name = (
-            exact_name_map.get(str(normalized or '').lower())
-            or exact_name_map.get(str(raw_name or '').lower())
-            or normalized
-            or raw_name
-        )
+        exact_name = exact_name_map.get(str(raw_name or '').lower())
+        if exact_name is None:
+            exact_name = exact_name_map.get(str(normalized or '').lower())
+        if exact_name is None:
+            stats['filtered'] += 1
+            continue
 
         raw_arguments = func.get('arguments') if 'arguments' in func else tc.get('arguments')
         ok, value = normalize_tool_arguments_as_json_object(raw_arguments)
+        if not ok:
+            stats['invalid_arguments_filtered'] += 1
+            continue
 
         merged_func = {}
         if isinstance(func, dict):
             merged_func.update(func)
         merged_func['name'] = exact_name
-        merged_func['arguments'] = value if ok else json.dumps(raw_arguments or {})
+        merged_func['arguments'] = value
 
         result = dict(tc)
         result['function'] = merged_func

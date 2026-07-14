@@ -10,11 +10,18 @@ the cache + single-flight + serve-stale behavior that prevents that.
 """
 
 import asyncio
+import gzip
+import json
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core.model_context import replace_model_context_catalog  # noqa: E402
+from core.protobuf_builder import (  # noqa: E402
+    build_gzip_framed_protobuf_chat_request_body,
+)
 from proto import cursor_api_pb2 as pb  # noqa: E402
 from routes import model_routes  # noqa: E402
 
@@ -27,9 +34,47 @@ def _models_buffer(*names: str) -> bytes:
     return resp.SerializeToString()
 
 
+def _varint(value: int) -> bytes:
+    encoded = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        encoded.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(encoded)
+
+
+def _merge_unknown_varint(message, field_number: int, value: int) -> None:
+    message.MergeFromString(_varint(field_number << 3) + _varint(value))
+
+
+def _merge_unknown_bytes(message, field_number: int, payload: bytes) -> None:
+    tag = _varint((field_number << 3) | 2)
+    message.MergeFromString(tag + _varint(len(payload)) + payload)
+
+
+def _add_tooltip_context(model, context: str, *, max_mode: bool = False) -> None:
+    markdown = f"**Model**<br /><br />{context} context window".encode()
+    tooltip = _varint((7 << 3) | 2) + _varint(len(markdown)) + markdown
+    _merge_unknown_bytes(model, 20 if max_mode else 8, tooltip)
+
+
+def _decode_chat_request(body: bytes):
+    magic = body[0]
+    payload_length = struct.unpack(">I", body[1:5])[0]
+    payload = body[5 : 5 + payload_length]
+    if magic == 1:
+        payload = gzip.decompress(payload)
+    request = pb.StreamUnifiedChatWithToolsRequest()
+    request.ParseFromString(payload)
+    return request
+
+
 def _reset_cache() -> None:
     model_routes._model_cache["ids"] = []
+    model_routes._model_cache["metadata"] = {}
     model_routes._model_cache["fetched_at"] = 0.0
+    replace_model_context_catalog({})
 
 
 def _patch_send(monkeypatch, responses: list[dict]) -> dict:
@@ -113,6 +158,165 @@ def test_no_cache_propagates_failure(monkeypatch) -> None:
     except RuntimeError:
         raised = True
     assert raised
+
+
+def test_live_cursor_tooltip_context_is_cached_for_base_and_variant(monkeypatch) -> None:
+    """Use Cursor's live tooltip metadata instead of a local model-name map."""
+    _reset_cache()
+    upstream = pb.AvailableModelsResponse()
+    grok = upstream.models.add()
+    grok.name = "grok-4.5"
+    _add_tooltip_context(grok, "256k")
+    _add_tooltip_context(grok, "256k", max_mode=True)
+    _merge_unknown_bytes(grok, 36, b"cursor-grok-4.5-high")
+    future = upstream.models.add()
+    future.name = "future-model-without-context"
+
+    _patch_send(monkeypatch, [{"status": 200, "buffer": upstream.SerializeToString()}])
+    model_ids = asyncio.run(model_routes._list_model_ids("tok"))
+
+    assert model_ids == [
+        "grok-4.5",
+        "cursor-grok-4.5-high",
+        "future-model-without-context",
+    ]
+    assert model_routes._model_cache["metadata"] == {
+        "grok-4.5": {"context_length": 256000, "max_context_length": 256000},
+        "cursor-grok-4.5-high": {
+            "context_length": 256000,
+            "max_context_length": 256000,
+        },
+    }
+
+    response = model_routes._models_response(model_ids)
+    body = json.loads(response.body)
+    assert body == {
+        "object": "list",
+        "data": [
+            {
+                "id": "grok-4.5",
+                "object": "model",
+                "created": 0,
+                "owned_by": "cursor",
+                "context_length": 256000,
+            },
+            {
+                "id": "cursor-grok-4.5-high",
+                "object": "model",
+                "created": 0,
+                "owned_by": "cursor",
+                "context_length": 256000,
+            },
+            {
+                "id": "future-model-without-context",
+                "object": "model",
+                "created": 0,
+                "owned_by": "cursor",
+            },
+        ],
+    }
+
+
+def test_dual_context_models_expose_normal_and_max_mode_ids(monkeypatch) -> None:
+    """Every effort variant gets an adjacent synthetic Max Context selection."""
+    _reset_cache()
+    upstream = pb.AvailableModelsResponse()
+    opus = upstream.models.add()
+    opus.name = "claude-opus-4-8"
+    _add_tooltip_context(opus, "300k")
+    _add_tooltip_context(opus, "1m", max_mode=True)
+    _merge_unknown_bytes(opus, 36, b"claude-opus-4-8-max")
+
+    _patch_send(monkeypatch, [{"status": 200, "buffer": upstream.SerializeToString()}])
+    model_ids = asyncio.run(model_routes._list_model_ids("tok"))
+
+    assert model_ids == [
+        "claude-opus-4-8",
+        "claude-opus-4-8[1m]",
+        "claude-opus-4-8-max",
+        "claude-opus-4-8-max[1m]",
+    ]
+    body = json.loads(model_routes._models_response(model_ids).body)
+    assert [item["context_length"] for item in body["data"]] == [
+        300000,
+        1000000,
+        300000,
+        1000000,
+    ]
+
+
+def test_context_suffix_routes_same_model_through_max_mode(monkeypatch) -> None:
+    """The synthetic suffix selects Max Mode but never reaches Cursor's model name."""
+    replace_model_context_catalog(
+        {
+            "claude-opus-4-8-max": {
+                "context_length": 300000,
+                "max_context_length": 1000000,
+            }
+        }
+    )
+    long_message = [{"role": "user", "content": "x" * 21001}]
+    short_message = [{"role": "user", "content": "hello"}]
+
+    normal = _decode_chat_request(
+        build_gzip_framed_protobuf_chat_request_body(
+            long_message,
+            "claude-opus-4-8-max",
+            agent_mode=True,
+        )
+    )
+    max_mode = _decode_chat_request(
+        build_gzip_framed_protobuf_chat_request_body(
+            short_message,
+            "claude-opus-4-8-max[1m]",
+            agent_mode=True,
+        )
+    )
+    unknown_legacy = _decode_chat_request(
+        build_gzip_framed_protobuf_chat_request_body(
+            long_message,
+            "model-without-dual-context",
+            agent_mode=True,
+        )
+    )
+
+    assert normal.request.model.name == "claude-opus-4-8-max"
+    assert normal.request.largeContext == 0
+    assert max_mode.request.model.name == "claude-opus-4-8-max"
+    assert max_mode.request.largeContext == 1
+    assert unknown_legacy.request.largeContext == 1
+
+
+def test_numeric_context_field_wins_when_cursor_populates_it(monkeypatch) -> None:
+    """The stable numeric field takes precedence over human-readable tooltip text."""
+    response = pb.AvailableModelsResponse()
+    model = response.models.add()
+    model.name = "future-model"
+    _merge_unknown_varint(model, 15, 300000)
+    _merge_unknown_varint(model, 16, 1200000)
+    _add_tooltip_context(model, "256k")
+    _add_tooltip_context(model, "1m", max_mode=True)
+
+    assert model_routes._extract_model_context_metadata(model) == {
+        "context_length": 300000,
+        "max_context_length": 1200000,
+    }
+
+
+def test_model_detail_uses_live_cache_and_validated_max_marker(monkeypatch) -> None:
+    """Detail probes reuse live metadata and cannot invent unobserved models."""
+    model_routes._model_cache["ids"] = ["gpt-next"]
+    model_routes._model_cache["metadata"] = {
+        "gpt-next": {"context_length": 300000, "max_context_length": 1000000}
+    }
+
+    normal = asyncio.run(model_routes.get_model_detail("gpt-next"))
+    max_mode = asyncio.run(model_routes.get_model_detail("gpt-next[1m]"))
+    unknown = asyncio.run(model_routes.get_model_detail("unknown[1m]"))
+
+    assert json.loads(normal.body)["context_length"] == 300000
+    assert json.loads(max_mode.body)["context_length"] == 1000000
+    assert unknown.status_code == 404
 
 
 def test_placeholder_api_key_falls_back_to_env_token(monkeypatch) -> None:

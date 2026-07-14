@@ -96,13 +96,13 @@ _CONTROL_TOKEN_CANDIDATES = ("</think>", "<|final|>", "<｜final｜>", "< | fina
 
 
 def _control_token_prefix_len(value: str) -> int:
-    """Length of the longest trailing run of *value* that could be the start of
-    a control token (so it can be held back across streaming chunks)."""
-    max_len = min(len(value), max(len(c) for c in _CONTROL_TOKEN_CANDIDATES))
+    """Retain a trailing partial control token or Composer marker prefix."""
+    candidates = (*_CONTROL_TOKEN_CANDIDATES, *TOOL_MARKER_CANDIDATES)
+    max_len = min(len(value), max(len(candidate) for candidate in candidates))
     keep = 0
     for length in range(1, max_len + 1):
         suffix = value[len(value) - length:]
-        if any(c.startswith(suffix) for c in _CONTROL_TOKEN_CANDIDATES):
+        if any(candidate.startswith(suffix) and suffix != candidate for candidate in candidates):
             keep = length
     return keep
 
@@ -126,6 +126,10 @@ class _ControlTokenFilter:
             return cleaned
         self._buffer = cleaned[len(cleaned) - keep:]
         return cleaned[: len(cleaned) - keep]
+
+    def pending(self) -> str:
+        """Return the unresolved trailing control-token candidate."""
+        return self._buffer
 
     def flush(self) -> str:
         cleaned = strip_composer_control_tokens(self._buffer)
@@ -176,6 +180,13 @@ def _tool_marker_prefix_index(value: str) -> int:
     return -1
 
 
+def _is_unambiguous_tool_marker_prefix(value: str) -> bool:
+    """Whether a pending prefix distinguishes a tool marker from literal '<'."""
+    return len(value) >= 2 and any(
+        marker.startswith(value) for marker in TOOL_MARKER_CANDIDATES
+    )
+
+
 # ── Tool-call body parsing ─────────────────────────────────────────────────
 
 
@@ -193,16 +204,14 @@ def _first_not_none(*values):
     return None
 
 
-def _record_from_tool_arguments(value) -> dict | None:
-    if isinstance(value, dict):
+def _record_from_tool_arguments(value):
+    """Decode JSON strings but retain invalid argument values for validation."""
+    if not isinstance(value, str):
         return value
-    if not isinstance(value, str) or not value.strip():
-        return None
     try:
-        decoded = json.loads(value)
+        return json.loads(value)
     except (json.JSONDecodeError, ValueError):
-        return None
-    return decoded if isinstance(decoded, dict) else None
+        return value
 
 
 def _parse_composer_tool_argument(value: str):
@@ -298,15 +307,19 @@ def _parse_json_tool_call_body(value: str) -> dict | None:
     )
     if not name:
         return None
-    raw_args = _first_not_none(
-        parsed.get("arguments"),
-        parsed.get("args"),
-        parsed.get("input"),
-        parsed.get("parameters"),
-        parsed.get("params"),
-        fn.get("arguments") if fn else None,
+    argument_sources = (
+        (parsed, "arguments"),
+        (parsed, "args"),
+        (parsed, "input"),
+        (parsed, "parameters"),
+        (parsed, "params"),
+        (fn, "arguments"),
     )
-    return {"name": name, "arguments": _record_from_tool_arguments(raw_args) or {}}
+    raw_args = next(
+        (source[key] for source, key in argument_sources if source is not None and key in source),
+        {},
+    )
+    return {"name": name, "arguments": _record_from_tool_arguments(raw_args)}
 
 
 def _parse_tool_call_body(value: str) -> dict | None:
@@ -391,6 +404,19 @@ class ComposerToolCallFilter:
 
     def flush(self) -> list[_MarkerEvent]:
         return self._drain(force=True)
+
+    def pending_tool_block(self) -> str:
+        """Return an unfinished marker block or marker prefix without exposing it."""
+        begin = _find_tool_marker(self._buffer, "tool_calls_begin")
+        if begin is not None:
+            block = self._buffer[begin[0]:]
+            if _find_tool_marker(block[begin[1]:], "tool_calls_end") is None:
+                return block
+        prefix_index = _tool_marker_prefix_index(self._buffer)
+        if prefix_index < 0:
+            return ""
+        prefix = self._buffer[prefix_index:]
+        return prefix if _is_unambiguous_tool_marker_prefix(prefix) else ""
 
     def _drain(self, force: bool) -> list[_MarkerEvent]:
         events: list[_MarkerEvent] = []
@@ -505,6 +531,15 @@ class ComposerStreamProcessor:
             if text:
                 self._answer_started = True
         return ComposerEmit("", text, tool_calls)
+
+    def pending_tool_block(self) -> str:
+        """Return a buffered incomplete marker call for a retry prompt."""
+        pending = self._tool_filter.pending_tool_block()
+        if pending:
+            return pending
+        marker_filter = ComposerToolCallFilter()
+        marker_filter.push(self._control_filter.pending())
+        return marker_filter.pending_tool_block()
 
     def flush(self) -> ComposerEmit:
         text_parts: list[str] = []

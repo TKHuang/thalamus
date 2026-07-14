@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from core.model_context import resolve_model_context_mode
 from proto import cursor_api_pb2 as pb
 
 from utils.structured_logging import ThalamusStructuredLogger
@@ -83,7 +84,13 @@ def build_gzip_framed_protobuf_chat_request_body(
     mode_enum = 2 if agent_mode else 1
     mode_string = "Agent" if agent_mode else "Ask"
 
-    parsed = [{**msg, **parse_multimodal_content(msg.get("content", ""))} for msg in messages]
+    upstream_model_name, explicit_large_context = resolve_model_context_mode(
+        model_name
+    )
+    parsed = [
+        {**msg, **parse_multimodal_content(msg.get("content", ""))}
+        for msg in messages
+    ]
     total_content_length = sum(len(m.get("content", "")) for m in parsed)
 
     instruction_text = "\n".join(
@@ -142,7 +149,7 @@ def build_gzip_framed_protobuf_chat_request_body(
     r.unknown2 = 1
     r.instruction.instruction = instruction_text
     r.unknown4 = 1
-    r.model.name = model_name
+    r.model.name = upstream_model_name
     r.model.empty = b""
     r.webTool = ""
     r.unknown13 = 1
@@ -178,7 +185,10 @@ def build_gzip_framed_protobuf_chat_request_body(
         if "summaryId" in mid:
             proto_mid.summaryId = mid["summaryId"]
 
-    r.largeContext = 1 if total_content_length > 20000 else 0
+    if explicit_large_context is None:
+        r.largeContext = 1 if total_content_length > 20000 else 0
+    else:
+        r.largeContext = 1 if explicit_large_context else 0
     r.unknown38 = 0
     r.chatModeEnum = mode_enum
     r.unknown47 = ""

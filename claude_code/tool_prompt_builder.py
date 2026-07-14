@@ -10,7 +10,15 @@ in its conversation history and naturally learns to output the same format.
 import json
 import logging
 import re
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from claude_code.tool_protocols import ProtocolAdapter
+
+from claude_code.tool_prompt_rules import (
+    CLIENT_TOOL_INVENTORY_AUTHORITY_RULE,
+    POST_TOOL_OUTPUT_FORMAT_RULE,
+)
 from config.system_prompt import (
     COMPOSER_TOOL_PROMPT_HEADER,
     COMPOSER_TURN1_USER,
@@ -55,7 +63,105 @@ ASK_MODE_CONTAMINATION_PATTERNS: list[re.Pattern] = [
 ]
 
 
-def build_tool_call_prompt(tools: list[dict], composer: bool = False) -> str:
+def _compact_type(pdef: dict) -> str:
+    ptype = pdef.get("type") if isinstance(pdef, dict) else None
+    if isinstance(ptype, list):
+        return "|".join(str(t) for t in ptype)
+    if isinstance(ptype, str):
+        return ptype
+    if isinstance(pdef, dict):
+        if pdef.get("enum"):
+            return "enum"
+        if pdef.get("anyOf") or pdef.get("oneOf"):
+            return "value"
+    return "string"
+
+
+def _compact_tool_signature(tool_def: dict) -> tuple[str, str]:
+    fn = tool_def.get("function") or tool_def
+    name = fn.get("name", "")
+    schema = fn.get("input_schema") or fn.get("parameters") or {}
+    properties = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+
+    params = []
+    for pname, pdef in properties.items():
+        suffix = "!" if pname in required else ""
+        params.append(f"{pname}:{_compact_type(pdef)}{suffix}")
+    return name, f"{name}({', '.join(params)})"
+
+
+def _compact_example_for_tool(tool_def: dict) -> str:
+    fn = tool_def.get("function") or tool_def
+    name = fn.get("name", "")
+    schema = fn.get("input_schema") or fn.get("parameters") or {}
+    properties = schema.get("properties") or {}
+    required = list(schema.get("required") or [])
+
+    args = {}
+    for pname in required[:4]:
+        pdef = properties.get(pname) or {}
+        ptype = _compact_type(pdef)
+        if ptype == "boolean":
+            args[pname] = True
+        elif ptype in ("integer", "number"):
+            args[pname] = 1
+        elif ptype == "array":
+            args[pname] = []
+        elif ptype == "object":
+            args[pname] = {}
+        else:
+            args[pname] = f"<{pname}>"
+
+    return json.dumps(
+        {"type": "tool_use", "id": "toolu_01", "name": name, "input": args},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _build_compact_tool_call_prompt(tools: list[dict]) -> str:
+    usable = [tool for tool in tools if (tool.get("function") or tool).get("name")]
+    example_tool = next(
+        (tool for tool in usable if (tool.get("function") or tool).get("name") == "write_file"),
+        usable[0] if usable else {},
+    )
+
+    lines = [
+        "You have access to tools. For actions, output tool_use JSON lines only:",
+        '{"type":"tool_use","id":"toolu_<id>","name":"<exact_tool_name>","input":{...}}',
+        f"Example: {_compact_example_for_tool(example_tool)}" if example_tool else "",
+        'When the task is complete, call {"type":"tool_use","id":"toolu_done","name":"task_complete","input":{"result":"<summary>"}}.',
+        "If you plan to create, write, inspect, open, run, search, or verify anything, output the tool_use in the same response.",
+        "For direct file creation requests with a named file, call write_file first.",
+        "For write_file with generated HTML, prefer concise complete files under 8000 characters.",
+        "Use exact CLIENT tool names listed below. Cursor built-in tool names will fail.",
+        CLIENT_TOOL_INVENTORY_AUTHORITY_RULE,
+        POST_TOOL_OUTPUT_FORMAT_RULE,
+        "Tool signatures (! = required):",
+    ]
+
+    for index, tool_def in enumerate(usable, 1):
+        fn = tool_def.get("function") or tool_def
+        desc = " ".join(str(fn.get("description", "")).split())
+        if len(desc) > 120:
+            desc = desc[:117] + "..."
+        _name, signature = _compact_tool_signature(tool_def)
+        line = f"{index}. {signature}"
+        if desc:
+            line += f" — {desc}"
+        lines.append(line)
+
+    lines.append('Completion signal: task_complete(result:string!).')
+    lines.append(f"Total: {len(usable)} client tool(s) plus task_complete.")
+    return "\n".join(line for line in lines if line)
+
+
+def build_tool_call_prompt(
+    tools: list[dict],
+    composer: bool = False,
+    compact: bool = False,
+) -> str:
     """Build a text prompt describing available tools.
 
     Non-composer models output tool calls as Anthropic native JSON:
@@ -64,6 +170,9 @@ def build_tool_call_prompt(tools: list[dict], composer: bool = False) -> str:
     Composer-2.x models use their native tool-call marker protocol instead, so
     they get a marker-format header and are told to use the client tool names.
     """
+    if compact and not composer:
+        return _build_compact_tool_call_prompt(tools)
+
     if composer:
         lines = [COMPOSER_TOOL_PROMPT_HEADER]
     else:
@@ -276,6 +385,11 @@ def _is_contaminated_assistant_message(content: str) -> bool:
     return any(p.search(content) for p in ASK_MODE_CONTAMINATION_PATTERNS)
 
 
+def _adapter_uses_composer_markers(adapter: ProtocolAdapter | None) -> bool:
+    """Whether an adapter requires Composer's marker prompt grammar."""
+    return adapter is not None and str(adapter.protocol) == "composer_marker_v1"
+
+
 def _build_brief_reminder(tools: list[dict], composer: bool = False) -> str:
     """Compact tool-name reminder injected periodically into conversation."""
     names = [(t.get("function") or t).get("name", "") for t in tools
@@ -299,9 +413,12 @@ def _build_brief_reminder(tools: list[dict], composer: bool = False) -> str:
 
 
 def inject_tool_prompt_into_messages(
-    messages: list[dict], tools: list[dict],
+    messages: list[dict],
+    tools: list[dict],
     reminder_interval: int = 10,
     composer: bool = False,
+    compact_tools: bool = False,
+    adapter: ProtocolAdapter | None = None,
 ) -> list[dict]:
     """Inject tool schemas and system turns into messages.
 
@@ -309,17 +426,28 @@ def inject_tool_prompt_into_messages(
     knows every available tool and its parameters.  Uses Anthropic native JSON
     format for tool_use/tool_result serialization in conversation history.
 
-    When ``composer`` is True the priming turns and tool prompt instruct the
-    Composer-2.x marker protocol (and the use of client tool names) instead of
-    Anthropic tool_use JSON.
+    When ``adapter`` is supplied, its manifest defines the active model's
+    tool grammar. The legacy ``composer`` flag remains for existing callers.
     """
     result: list[dict] = []
+    uses_composer_markers = _adapter_uses_composer_markers(adapter) if adapter else composer
 
-    result.append({"role": "user", "content": COMPOSER_TURN1_USER if composer else TURN1_USER})
-    result.append({"role": "assistant", "content": COMPOSER_TURN2_ASSISTANT if composer else TURN2_ASSISTANT})
+    if not compact_tools:
+        result.append({"role": "user", "content": COMPOSER_TURN1_USER if uses_composer_markers else TURN1_USER})
+        result.append({"role": "assistant", "content": COMPOSER_TURN2_ASSISTANT if uses_composer_markers else TURN2_ASSISTANT})
 
     if tools:
-        tool_prompt = build_tool_call_prompt(tools, composer=composer)
+        if adapter is None:
+            tool_prompt = build_tool_call_prompt(
+                tools,
+                composer=uses_composer_markers,
+                compact=compact_tools,
+            )
+        else:
+            tool_prompt = adapter.render_tool_manifest(
+                tools,
+                "Use the available client tools to fulfill the request.",
+            )
         result.append({"role": "user", "content": tool_prompt})
         result.append({"role": "assistant", "content": "(tools noted, ready to use them)"})
 
@@ -398,7 +526,7 @@ def inject_tool_prompt_into_messages(
         result.append(m)
 
     if tools and reminder_interval > 0:
-        reminder = _build_brief_reminder(tools, composer=composer)
+        reminder = _build_brief_reminder(tools, composer=uses_composer_markers)
         result = _inject_periodic_reminders(result, reminder, reminder_interval)
 
     result = _merge_consecutive_same_role(result)

@@ -2,7 +2,7 @@ from __future__ import annotations
 """
 Thalamus external API logger.
 
-Logs Claude CLI → thalamus requests and responses:
+When THALAMUS_RAW_PAYLOAD_LOGGING=true, logs Claude CLI → thalamus requests and responses:
   1. Request payload file:  logs/<session>/<date>/thalamus-api/payloads/<request_id>_request.json
   2. Response payload file: logs/<session>/<date>/thalamus-api/payloads/<request_id>_response.json
   3. One-line entry in:     logs/<session>/<date>/thalamus-api/api-calls.log
@@ -19,6 +19,7 @@ import os
 import re
 from datetime import datetime, timezone, timedelta
 
+from utils.raw_payload_logging import is_raw_payload_logging_enabled
 from utils.structured_logging import ThalamusStructuredLogger
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -97,7 +98,9 @@ def log_thalamus_request(
     payload: dict,
     headers_summary: dict | None = None,
 ) -> str:
-    """Write request payload to file. Returns the absolute path of the payload file."""
+    """Write request payload to file when raw payload logging is enabled."""
+    if not is_raw_payload_logging_enabled():
+        return ""
     payload_dir = _payload_dir()
     filename = f"{request_id}_request.json"
     filepath = os.path.join(payload_dir, filename)
@@ -123,10 +126,12 @@ def log_thalamus_response(
     sse_events_or_body: list[dict[str, str]] | dict,
     latency_ms: int | None = None,
 ) -> str:
-    """Write response payload to file. Returns the absolute path of the payload file.
+    """Write response payload to file when raw payload logging is enabled.
 
     sse_events_or_body: For SSE: list of {"event": str, "data": str}. For JSON: response body dict.
     """
+    if not is_raw_payload_logging_enabled():
+        return ""
     payload_dir = _payload_dir()
     filename = f"{request_id}_response.json"
     filepath = os.path.join(payload_dir, filename)
@@ -158,7 +163,9 @@ def log_thalamus_api_call(
     res_path: str,
     error: str | None = None,
 ) -> None:
-    """Append a single-line summary to api-calls.log referencing payload files."""
+    """Append raw payload-file references when raw payload logging is enabled."""
+    if not is_raw_payload_logging_enabled():
+        return
     ts = _beijing_timestamp()
     err_part = f" error={error}" if error else ""
     line = (
