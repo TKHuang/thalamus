@@ -29,6 +29,18 @@ UI_PORT = int(os.environ.get("UI_PORT", "3014"))
 WIN_W, WIN_H = 440, 600
 
 
+def _ensure_standard_streams() -> None:
+    """Give GUI builds writable streams for libraries that expect a console.
+
+    PyInstaller sets stdout and stderr to None for ``--windowed`` executables.
+    Uvicorn's logging setup calls ``sys.stdout.isatty()``, so point missing
+    streams at the null device before importing/configuring the backend.
+    """
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
 def _resource_bases() -> list[Path]:
     """Directories to search for bundled resources, most specific first.
 
@@ -97,7 +109,11 @@ def start_backend() -> None:
     import server  # exposes `app`; its __main__ block is guarded, so import is safe
 
     config = uvicorn.Config(
-        server.app, host="127.0.0.1", port=THALAMUS_PORT, log_level="info"
+        server.app,
+        host="127.0.0.1",
+        port=THALAMUS_PORT,
+        log_level="info",
+        use_colors=False,
     )
     uv = uvicorn.Server(config)
     # uvicorn.Server.run() skips installing signal handlers off the main thread,
@@ -119,6 +135,7 @@ def start_ui() -> None:
 
 
 def main() -> None:
+    _ensure_standard_streams()
     _lock = acquire_single_instance()  # noqa: F841 — held to keep the lock alive
 
     os.environ.setdefault("THALAMUS_HOST", "127.0.0.1")

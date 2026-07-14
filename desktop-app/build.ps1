@@ -44,6 +44,12 @@ $RepoDir = if ($ThalamusPath) {
 }
 $AppName = "Thalamus-PyInstaller"
 
+function Assert-NativeSuccess([string]$Step) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Step failed with exit code $LASTEXITCODE."
+    }
+}
+
 Write-Host "========================================="
 Write-Host "  Thalamus single-file build (PyInstaller)"
 Write-Host "  repo:    $RepoDir"
@@ -55,19 +61,26 @@ $VenvPy = Join-Path $RepoDir ".venv\Scripts\python.exe"
 if (-not (Test-Path $VenvPy)) {
     Write-Host "Creating .venv ..."
     & py -3 -m venv (Join-Path $RepoDir ".venv")
+    Assert-NativeSuccess "Creating .venv"
 }
 
 # 2. Install runtime + desktop/build dependencies into the venv
 Write-Host "Installing dependencies ..."
+& $VenvPy -m ensurepip --upgrade
+Assert-NativeSuccess "Bootstrapping pip"
 & $VenvPy -m pip install --upgrade pip
+Assert-NativeSuccess "Upgrading pip"
 & $VenvPy -m pip install -r (Join-Path $RepoDir "requirements.txt")
+Assert-NativeSuccess "Installing server dependencies"
 & $VenvPy -m pip install -r (Join-Path $RepoDir "requirements-desktop.txt")
+Assert-NativeSuccess "Installing desktop dependencies"
 
 # 3. Generate the Windows icon (.ico) if missing
 $IconIco = Join-Path $ScriptDir "assets\icon.ico"
 if (-not (Test-Path $IconIco)) {
     Write-Host "Generating icon.ico ..."
     & $VenvPy (Join-Path $ScriptDir "generate_icon.py")
+    Assert-NativeSuccess "Generating icon.ico"
 }
 
 # 4. Freeze the WHOLE app into one file.
@@ -120,6 +133,7 @@ Write-Host "Running PyInstaller ..."
 Push-Location $ScriptDir
 try {
     & $VenvPy @pyiArgs
+    Assert-NativeSuccess "Running PyInstaller"
 } finally {
     Pop-Location
 }
