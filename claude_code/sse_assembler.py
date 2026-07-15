@@ -28,9 +28,10 @@ class StreamingAnthropicSession:
 
     format_sse = staticmethod(format_sse)
 
-    def __init__(self, message_id: str, model: str) -> None:
+    def __init__(self, message_id: str, model: str, input_tokens: int = 0) -> None:
         self.message_id = message_id
         self.model = model
+        self.input_tokens = max(0, int(input_tokens))
         self.block_index = 0
         self.thinking_index = -1
         self.text_index = -1
@@ -55,7 +56,7 @@ class StreamingAnthropicSession:
                     "content": [],
                     "stop_reason": None,
                     "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                    "usage": {"input_tokens": self.input_tokens, "output_tokens": 0},
                 },
             },
         )
@@ -230,7 +231,10 @@ class StreamingAnthropicSession:
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"output_tokens": output_tokens},
+                    "usage": {
+                        "input_tokens": self.input_tokens,
+                        "output_tokens": output_tokens,
+                    },
                 },
             )
         )
@@ -247,6 +251,7 @@ def build_unary_anthropic_response(
     thinking: str,
     tool_calls: list[dict[str, Any]],
     stop_reason_override: str = "",
+    input_tokens: int = 0,
 ) -> dict[str, Any]:
     """Build a complete non-streaming Anthropic response dict."""
     content: list[dict[str, Any]] = []
@@ -292,5 +297,8 @@ def build_unary_anthropic_response(
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {"input_tokens": 0, "output_tokens": output_tokens},
+        "usage": {
+            "input_tokens": max(0, int(input_tokens)),
+            "output_tokens": output_tokens,
+        },
     }

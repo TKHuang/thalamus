@@ -15,8 +15,11 @@ Port of: cursor_streaming_response_protobuf_frame_parser.js
 
 import gzip
 import json
+import math
 import struct
 from dataclasses import dataclass, field
+
+from google.protobuf.unknown_fields import UnknownFieldSet
 
 from proto import cursor_api_pb2 as pb
 
@@ -40,6 +43,77 @@ class ParseResult:
     thinking: str = ""
     text: str = ""
     errors: list[ParsedError] = field(default_factory=list)
+    context_remaining_percent: float | None = None
+
+
+def _extract_context_remaining_percent(message) -> float | None:
+    """Decode Cursor's server-computed remaining-context percentage."""
+    try:
+        message_fields = UnknownFieldSet(message)
+    except (NotImplementedError, TypeError):
+        return None
+
+    remaining_percent: float | None = None
+    for field in message_fields:
+        if field.field_number != 30 or field.wire_type != 2:
+            continue
+        value = _decode_remaining_percent_field(field.data)
+        if value is not None:
+            remaining_percent = value
+    return remaining_percent
+
+
+def _decode_remaining_percent_field(data: bytes) -> float | None:
+    """Read fixed32 field 4 from Cursor's undocumented field-30 message."""
+    offset = 0
+    while offset < len(data):
+        decoded_key = _read_varint(data, offset)
+        if decoded_key is None:
+            return None
+        key, offset = decoded_key
+        field_number = key >> 3
+        wire_type = key & 7
+
+        if wire_type == 0:
+            decoded_value = _read_varint(data, offset)
+            if decoded_value is None:
+                return None
+            _, offset = decoded_value
+        elif wire_type == 1:
+            offset += 8
+        elif wire_type == 2:
+            decoded_length = _read_varint(data, offset)
+            if decoded_length is None:
+                return None
+            length, offset = decoded_length
+            offset += length
+        elif wire_type == 5:
+            if offset + 4 > len(data):
+                return None
+            if field_number == 4:
+                value = struct.unpack("<f", data[offset:offset + 4])[0]
+                if math.isfinite(value) and 0.0 <= value <= 100.0:
+                    return value
+            offset += 4
+        else:
+            return None
+
+        if offset > len(data):
+            return None
+    return None
+
+
+def _read_varint(data: bytes, offset: int) -> tuple[int, int] | None:
+    value = 0
+    shift = 0
+    while offset < len(data) and shift < 64:
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, offset
+        shift += 7
+    return None
 
 
 class ProtobufFrameParser:
@@ -56,6 +130,7 @@ class ProtobufFrameParser:
         thinking_parts: list[str] = []
         text_parts: list[str] = []
         errors: list[ParsedError] = []
+        context_remaining_percent: float | None = None
 
         while len(self._buf) >= 5:
             magic = self._buf[0]
@@ -76,6 +151,9 @@ class ProtobufFrameParser:
 
                     if response.HasField("message"):
                         msg = response.message
+                        current_remaining = _extract_context_remaining_percent(msg)
+                        if current_remaining is not None:
+                            context_remaining_percent = current_remaining
                         if msg.HasField("thinking") and msg.thinking.content:
                             thinking_parts.append(msg.thinking.content)
                         if msg.content:
@@ -117,6 +195,7 @@ class ProtobufFrameParser:
             thinking="".join(thinking_parts),
             text="".join(text_parts),
             errors=errors,
+            context_remaining_percent=context_remaining_percent,
         )
 
 

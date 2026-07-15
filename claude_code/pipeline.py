@@ -37,6 +37,8 @@ from core.protobuf_builder import (
 )
 from core.protobuf_frame_parser import CURSOR_ABORT_ERROR_CODE, ProtobufFrameParser
 from core.cursor_h2_client import open_streaming_h2_request
+from core.model_context import get_model_context_length
+from core.token_usage import estimate_input_tokens, input_tokens_from_remaining_context
 from claude_code.tool_prompt_builder import inject_tool_prompt_into_messages, _merge_consecutive_same_role
 from config.system_prompt import THALAMUS_INSTRUCTION_SUPPLEMENT
 from claude_code.composer_tool_parser import (
@@ -735,6 +737,7 @@ async def consume_stream(
     text = ""
     thinking = ""
     errors: list[Any] = []
+    context_remaining_percent: float | None = None
     had_content = False
     has_fatal_error = False
     chunk_count = 0
@@ -754,6 +757,7 @@ async def consume_stream(
             "composer_tool_calls": composer_tool_calls,
             "interrupted_tool_state": interrupted_tool_state,
             "errors": filtered_errors,
+            "context_remaining_percent": context_remaining_percent,
             "had_content": had_content,
             "has_fatal_error": has_fatal_error,
             "metrics": {
@@ -792,6 +796,11 @@ async def consume_stream(
             logger.debug(f"[consume] chunk#{chunk_count} len={len(chunk)} hex_head={chunk[:20].hex()}")
 
             result = parser.parse(chunk)
+            if (
+                context_remaining_percent is None
+                and result.context_remaining_percent is not None
+            ):
+                context_remaining_percent = result.context_remaining_percent
             logger.debug(
                 f"[consume] chunk#{chunk_count} parsed: text_len={len(result.text)} "
                 f"thinking_len={len(result.thinking)} errors={len(result.errors)}"
@@ -911,6 +920,7 @@ async def _call_cursor_direct(
     repair_attempted = False
     fallback_reason: str | None = None
     last_attempt_trace: CompatibilityTrace | None = None
+    last_context_remaining_percent: float | None = None
 
     while len(tried_models) < fallback_cfg.max_attempts:
         attempt_number = len(tried_models) + 1
@@ -1049,6 +1059,7 @@ async def _call_cursor_direct(
                 on_upstream_attempt=trace_upstream_attempt,
             )
             consumed = attempt.consumed
+            last_context_remaining_percent = consumed.get("context_remaining_percent")
             repair_attempted = repair_attempted or attempt.repair_attempted
             if attempt.repair_attempted:
                 logger.info(
@@ -1086,6 +1097,8 @@ async def _call_cursor_direct(
                 "error": err_msg,
                 "status": 503,
                 "fallback_attempts": len(tried_models),
+            "context_remaining_percent": last_context_remaining_percent,
+                "context_remaining_percent": last_context_remaining_percent,
                 "model": current_model,
             }
 
@@ -1121,6 +1134,8 @@ async def _call_cursor_direct(
                 "error": err_detail,
                 "status": 503,
                 "fallback_attempts": len(tried_models),
+            "context_remaining_percent": last_context_remaining_percent,
+                "context_remaining_percent": last_context_remaining_percent,
                 "model": current_model,
             }
 
@@ -1186,6 +1201,8 @@ async def _call_cursor_direct(
                 "thinking": clean_thinking,
                 "model": current_model,
                 "fallback_attempts": len(tried_models),
+            "context_remaining_percent": last_context_remaining_percent,
+                "context_remaining_percent": last_context_remaining_percent,
                 "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
             }
 
@@ -1214,6 +1231,8 @@ async def _call_cursor_direct(
                     "thinking": clean_thinking,
                     "model": current_model,
                     "fallback_attempts": len(tried_models),
+            "context_remaining_percent": last_context_remaining_percent,
+                "context_remaining_percent": last_context_remaining_percent,
                     "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
                 }
             converted_tcs = final_tcs
@@ -1232,6 +1251,8 @@ async def _call_cursor_direct(
                 "model": current_model,
                 "stats": {"passed": len(converted_tcs), "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
                 "fallback_attempts": len(tried_models),
+            "context_remaining_percent": last_context_remaining_percent,
+                "context_remaining_percent": last_context_remaining_percent,
             }
 
         if not parsed_tcs and _should_accept_final_text_without_continuation(
@@ -1247,6 +1268,8 @@ async def _call_cursor_direct(
                 "thinking": clean_thinking,
                 "model": current_model,
                 "fallback_attempts": len(tried_models),
+            "context_remaining_percent": last_context_remaining_percent,
+                "context_remaining_percent": last_context_remaining_percent,
                 "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
             }
 
@@ -1297,6 +1320,7 @@ async def _call_cursor_direct(
                     on_upstream_attempt=trace_upstream_attempt,
                 )
                 consumed_c = continuation_attempt.consumed
+                last_context_remaining_percent = consumed_c.get("context_remaining_percent")
                 assert last_attempt_trace is not None
                 continuation_trace = last_attempt_trace
                 repair_attempted = repair_attempted or continuation_attempt.repair_attempted
@@ -1354,6 +1378,8 @@ async def _call_cursor_direct(
                         "thinking": first_thinking,
                         "model": current_model,
                         "fallback_attempts": len(tried_models),
+            "context_remaining_percent": last_context_remaining_percent,
+                "context_remaining_percent": last_context_remaining_percent,
                         "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
                     }
 
@@ -1380,6 +1406,8 @@ async def _call_cursor_direct(
                         "model": current_model,
                         "stats": {"passed": len(real_tcs), "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
                         "fallback_attempts": len(tried_models),
+            "context_remaining_percent": last_context_remaining_percent,
+                "context_remaining_percent": last_context_remaining_percent,
                     }
 
             accumulated_text = retry_text
@@ -1401,6 +1429,7 @@ async def _call_cursor_direct(
             "thinking": first_thinking,
             "model": current_model,
             "fallback_attempts": len(tried_models),
+            "context_remaining_percent": last_context_remaining_percent,
             "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
         }
 
@@ -1803,9 +1832,12 @@ def _build_streaming_result_anthropic(
     client_format: str | None = None,
 ) -> dict:
     message_id = f"msg_{uuid.uuid4().hex}"
+    estimated_input_tokens = estimate_input_tokens(messages, tools)
 
     async def stream_handler() -> AsyncIterator[str]:
-        session = StreamingAnthropicSession(message_id, resolved_model)
+        session = StreamingAnthropicSession(
+            message_id, resolved_model, input_tokens=estimated_input_tokens
+        )
         yield session.emit_message_start()
 
         limiter = _OutputLimiter(max_tokens)
@@ -1813,7 +1845,6 @@ def _build_streaming_result_anthropic(
 
         thinking_started = False
         thinking_ended = False
-
         def _enqueue_text_fragments(text: str) -> None:
             """Split text into DELTA_TARGET_SIZE chunks and enqueue as text_delta SSE."""
             for i in range(0, len(text), DELTA_TARGET_SIZE):
@@ -1888,6 +1919,12 @@ def _build_streaming_result_anthropic(
                 await asyncio.sleep(0.005)
 
         direct_result = cursor_task.result()
+        used_model = direct_result.get("model") or resolved_model
+        session.input_tokens = input_tokens_from_remaining_context(
+            get_model_context_length(used_model),
+            direct_result.get("context_remaining_percent"),
+            estimated_input_tokens,
+        )
 
         if direct_result.get("error"):
             logger.error(
@@ -1930,7 +1967,6 @@ def _build_streaming_result_anthropic(
 
         yield session.finish(stop_reason=stop_reason)
 
-        used_model = direct_result.get("model") or resolved_model
         latency = _elapsed_ms(pipeline_start)
         logger.info(
             f"[{request_id}] pipeline=claude_code stage=result(stream/anthropic) model={used_model} "
@@ -1959,16 +1995,18 @@ def _build_streaming_result_openai(
     client_format: str | None = None,
 ) -> dict:
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    estimated_input_tokens = estimate_input_tokens(messages, tools)
 
     async def stream_handler() -> AsyncIterator[str]:
-        session = StreamingOpenAISession(completion_id, resolved_model)
+        session = StreamingOpenAISession(
+            completion_id, resolved_model, input_tokens=estimated_input_tokens
+        )
         yield session.emit_role_chunk()
 
         limiter = _OutputLimiter(max_tokens)
         sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
         pending_reasoning: deque[str] = deque()
         pending_reasoning_chars = 0
-
         def _emit_and_enqueue(text: str) -> str | None:
             if text:
                 for i in range(0, len(text), DELTA_TARGET_SIZE):
@@ -2058,6 +2096,12 @@ def _build_streaming_result_openai(
             raise
 
         direct_result = cursor_task.result()
+        used_model = direct_result.get("model") or resolved_model
+        session.input_tokens = input_tokens_from_remaining_context(
+            get_model_context_length(used_model),
+            direct_result.get("context_remaining_percent"),
+            estimated_input_tokens,
+        )
 
         if direct_result.get("error"):
             logger.error(
@@ -2094,7 +2138,6 @@ def _build_streaming_result_openai(
 
         yield session.finish(stop_reason=stop_reason)
 
-        used_model = direct_result.get("model") or resolved_model
         latency = _elapsed_ms(pipeline_start)
         logger.info(
             f"[{request_id}] pipeline=claude_code stage=result(stream/openai) model={used_model} "
@@ -2124,7 +2167,6 @@ async def _build_unary_result(
     requested_model: str | None = None,
 ) -> dict:
     """Build a non-streaming result."""
-
     trace_context = (
         {"requested_model": requested_model, "client_format": original_format}
         if requested_model is not None
@@ -2154,6 +2196,11 @@ async def _build_unary_result(
         }
 
     used_model = direct_result.get("model") or resolved_model
+    input_tokens = input_tokens_from_remaining_context(
+        get_model_context_length(used_model),
+        direct_result.get("context_remaining_percent"),
+        estimate_input_tokens(messages, tools),
+    )
     tool_calls = _strip_internal_task_complete_tool_calls(
         direct_result.get("tool_calls") or []
     )
@@ -2192,6 +2239,7 @@ async def _build_unary_result(
             text=text,
             tool_calls=tool_calls,
             stop_reason_override=stop_reason_override,
+            input_tokens=input_tokens,
         )
     else:
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -2202,6 +2250,7 @@ async def _build_unary_result(
             thinking="",
             tool_calls=tool_calls,
             stop_reason_override=stop_reason_override,
+            input_tokens=input_tokens,
         )
 
     return {

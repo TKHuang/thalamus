@@ -16,9 +16,10 @@ def _format_openai_sse(data: dict[str, Any]) -> str:
 class StreamingOpenAISession:
     """Manages SSE event sequence for a single OpenAI-format streaming response."""
 
-    def __init__(self, completion_id: str, model: str) -> None:
+    def __init__(self, completion_id: str, model: str, input_tokens: int = 0) -> None:
         self.completion_id = completion_id
         self.model = model
+        self.input_tokens = max(0, int(input_tokens))
         self.created = int(time.time())
         self._tool_call_index = 0
         self._has_content = False
@@ -144,9 +145,9 @@ class StreamingOpenAISession:
                 "finish_reason": finish_reason,
             }],
             usage={
-                "prompt_tokens": 0,
+                "prompt_tokens": self.input_tokens,
                 "completion_tokens": math.ceil(self._total_text_len / 4),
-                "total_tokens": math.ceil(self._total_text_len / 4),
+                "total_tokens": self.input_tokens + math.ceil(self._total_text_len / 4),
             },
         )))
         out.append("data: [DONE]\n\n")
@@ -159,6 +160,7 @@ def build_unary_openai_response(
     text: str,
     tool_calls: list[dict[str, Any]],
     stop_reason_override: str = "",
+    input_tokens: int = 0,
 ) -> dict[str, Any]:
     """Build a complete non-streaming OpenAI Chat Completion response."""
     message: dict[str, Any] = {"role": "assistant"}
@@ -202,8 +204,8 @@ def build_unary_openai_response(
             "finish_reason": finish_reason,
         }],
         "usage": {
-            "prompt_tokens": 0,
+            "prompt_tokens": max(0, int(input_tokens)),
             "completion_tokens": math.ceil(total_len / 4),
-            "total_tokens": math.ceil(total_len / 4),
+            "total_tokens": max(0, int(input_tokens)) + math.ceil(total_len / 4),
         },
     }

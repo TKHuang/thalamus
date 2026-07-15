@@ -9,6 +9,13 @@ from claude_code.tool_prompt_builder import (  # noqa: E402
     build_tool_call_prompt,
     inject_tool_prompt_into_messages,
 )
+from config.system_prompt import (  # noqa: E402
+    COMPOSER_TURN1_USER,
+    COMPOSER_TURN2_ASSISTANT,
+    THALAMUS_INSTRUCTION_SUPPLEMENT,
+    TURN1_USER,
+    TURN2_ASSISTANT,
+)
 
 
 def _hermes_tools() -> list[dict]:
@@ -60,7 +67,7 @@ def test_compact_openai_tool_prompt_uses_actual_tool_names_and_stays_short():
     prompt = build_tool_call_prompt(_hermes_tools(), compact=True)
 
     assert len(prompt) < 2500
-    assert '"name":"write_file"' in prompt
+    assert '\"name\":\"write_file\"' in prompt
     assert "write_file(path:string!, content:string!)" in prompt
     assert "skill_view(skill:string!)" in prompt
     assert "task_complete(result:string!)" in prompt
@@ -94,6 +101,26 @@ def test_openai_injection_skips_claude_code_priming():
     assert "You have access to tools" in injected[0]["content"]
     assert "Claude Code" not in injected[0]["content"]
     assert injected[-1]["content"] == "make a file"
+
+
+def test_runtime_prompt_injections_are_harness_agnostic():
+    runtime_prompts = (
+        TURN1_USER,
+        TURN2_ASSISTANT,
+        THALAMUS_INSTRUCTION_SUPPLEMENT,
+        COMPOSER_TURN1_USER,
+        COMPOSER_TURN2_ASSISTANT,
+    )
+
+    for prompt in runtime_prompts:
+        assert "Claude Code" not in prompt
+        assert "Hermes" not in prompt
+        assert "Cursor" not in prompt
+
+    assert "Do not assume a specific client or harness identity" in THALAMUS_INSTRUCTION_SUPPLEMENT
+    assert "client-advertised tool inventory" in THALAMUS_INSTRUCTION_SUPPLEMENT
+    assert "identify only as an AI assistant" in THALAMUS_INSTRUCTION_SUPPLEMENT
+    assert "product, host, client, provider, company, IDE, CLI, framework, or router" in THALAMUS_INSTRUCTION_SUPPLEMENT
 
 
 def _run_all() -> int:

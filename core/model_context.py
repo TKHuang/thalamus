@@ -13,6 +13,7 @@ MODEL_CONTEXT_MARKER_RE = re.compile(
 # Replaced atomically whenever AvailableModels refreshes successfully.  Models
 # not present here retain the legacy request builder's automatic behavior.
 _dual_context_model_ids: frozenset[str] = frozenset()
+_model_context_catalog: dict[str, dict[str, int]] = {}
 
 
 def context_marker_for_length(context_length: int) -> str | None:
@@ -40,9 +41,31 @@ def strip_context_marker(model_id: str) -> str:
     return MODEL_CONTEXT_MARKER_RE.sub("", model_id)
 
 
+def get_model_context_length(model_id: str) -> int | None:
+    """Return the live context limit advertised for a model, when available."""
+    values = _model_context_catalog.get(model_id)
+    if values is None:
+        values = _model_context_catalog.get(strip_context_marker(model_id))
+    if values is None:
+        return None
+
+    if MODEL_CONTEXT_MARKER_RE.search(model_id):
+        maximum = values.get("max_context_length")
+        if isinstance(maximum, int) and maximum > 0:
+            return maximum
+
+    context_length = values.get("context_length")
+    return context_length if isinstance(context_length, int) and context_length > 0 else None
+
+
 def replace_model_context_catalog(metadata: dict[str, dict[str, int]]) -> None:
     """Register models whose normal and Max context modes are distinct."""
-    global _dual_context_model_ids
+    global _dual_context_model_ids, _model_context_catalog
+    _model_context_catalog = {
+        model_id: dict(values)
+        for model_id, values in metadata.items()
+        if isinstance(values, dict)
+    }
     dual_context_ids: set[str] = set()
     for model_id, values in metadata.items():
         if MODEL_CONTEXT_MARKER_RE.search(model_id):
