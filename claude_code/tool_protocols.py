@@ -65,14 +65,6 @@ class ProtocolAdapter(Protocol):
     def render_tool_manifest(self, tools: list[dict], execution_policy: str) -> str:
         raise NotImplementedError
 
-    def render_continuation(
-        self,
-        tools: list[dict],
-        user_intent: str,
-        prior_output: str,
-    ) -> str:
-        raise NotImplementedError
-
     def render_repair(self, tools: list[dict], interrupted_state: str) -> str:
         raise NotImplementedError
 

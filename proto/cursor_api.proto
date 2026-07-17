@@ -1,5 +1,7 @@
 syntax = "proto3";
 
+import "google/protobuf/struct.proto";
+
 message AvailableModelsResponse { 
   message AvailableModel {
     string name = 1;
@@ -21,6 +23,70 @@ message MessageSummary {
 message MessageThinking {
   string content = 1;
 }
+
+message MCPParams {
+  message TranscriptDisplay {
+    string loading = 1;
+    string success = 2;
+    string error = 3;
+  }
+
+  message Tool {
+    string name = 1;
+    string description = 2;
+    string parameters = 3;
+    string serverName = 4;
+    optional TranscriptDisplay transcriptDisplay = 5;
+  }
+
+  repeated Tool tools = 1;
+  optional int64 fileOutputThresholdBytes = 2;
+}
+
+// Cursor's generic MCP meta-tool payload.  The model calls enum 49 and the
+// actual request-scoped client tool is identified inside this message.
+message CallMcpToolParams {
+  string server = 1;
+  string toolName = 2;
+  google.protobuf.Struct toolArgs = 3;
+}
+
+message CallMcpToolStream {}
+
+message ClientSideToolV2Call {
+  int32 tool = 1;
+  string toolCallId = 3;
+  string name = 9;
+  string rawArgs = 10;
+  bool isStreaming = 14;
+  bool isLastMessage = 15;
+  CallMcpToolParams callMcpToolParams = 62;
+}
+
+message StreamedBackPartialToolCall {
+  int32 tool = 1;
+  string toolCallId = 2;
+  string name = 3;
+  optional uint32 toolIndex = 4;
+  optional string modelCallId = 5;
+}
+
+message StreamedBackToolCall {
+  int32 tool = 1;
+  string toolCallId = 2;
+  string name = 8;
+  string rawArgs = 9;
+  CallMcpToolStream callMcpToolStream = 63;
+}
+
+message StreamedBackToolCallV2 {
+  int32 tool = 1;
+  string toolCallId = 2;
+  string name = 8;
+  string rawArgs = 9;
+  CallMcpToolParams callMcpToolParams = 63;
+}
+
 message StreamUnifiedChatWithToolsRequest {
   message Request {
     message Message {
@@ -89,6 +155,7 @@ message StreamUnifiedChatWithToolsRequest {
     int32 unknown27 = 27; // 1 for is_agentic
     repeated int32 supportedTools = 29; // ClientSideToolV2 enum values for agent mode
     repeated MessageId messageIds = 30;
+    repeated MCPParams.Tool mcpTools = 34;
     int32 largeContext = 35; // 1
     int32 unknown38 = 38; // 0
     int32 chatModeEnum = 46; // 1 for ask, 2 for agent, 3 for edit
@@ -98,6 +165,7 @@ message StreamUnifiedChatWithToolsRequest {
     int32 unknown51 = 51; // 0
     int32 unknown53 = 53; // 0
     string chatMode = 54;
+    optional bool hasMcpDescriptors = 90;
   }
   
   Request request = 1;
@@ -126,8 +194,12 @@ message StreamUnifiedChatWithToolsResponse {
     string unknown23 = 23;
     string unknown27 = 27; // uuid
     MessageThinking thinking = 25;
+    StreamedBackToolCall toolCall = 13;
+    StreamedBackPartialToolCall partialToolCall = 15;
+    StreamedBackToolCallV2 toolCallV2 = 36;
   }
 
+  ClientSideToolV2Call clientSideToolV2Call = 1;
   Message message = 2;
   MessageSummary summary = 3;
 }

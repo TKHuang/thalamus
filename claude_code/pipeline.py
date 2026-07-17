@@ -12,8 +12,9 @@ Pipeline flow (format-agnostic):
 
 import asyncio
 from collections import deque
+from contextvars import ContextVar
+import inspect
 import json
-import os
 import re
 import time
 import uuid
@@ -37,9 +38,10 @@ from core.protobuf_builder import (
 )
 from core.protobuf_frame_parser import CURSOR_ABORT_ERROR_CODE, ProtobufFrameParser
 from core.cursor_h2_client import open_streaming_h2_request
+from core.cursor_agent_client import call_cursor_agent, resumable_agent_tool_names
 from core.model_context import get_model_context_length
 from core.token_usage import estimate_input_tokens, input_tokens_from_remaining_context
-from claude_code.tool_prompt_builder import inject_tool_prompt_into_messages, _merge_consecutive_same_role
+from claude_code.tool_prompt_builder import inject_tool_prompt_into_messages
 from config.system_prompt import THALAMUS_INSTRUCTION_SUPPLEMENT
 from claude_code.composer_tool_parser import (
     ComposerStreamProcessor,
@@ -55,11 +57,7 @@ from claude_code.tool_protocols import (
     classify_tool_protocol,
     create_protocol_adapter,
 )
-from claude_code.tool_lazy_loader import (
-    is_task_complete_call,
-    extract_task_complete_result,
-    MAX_CONTINUATION_RETRIES,
-)
+from claude_code.tool_choice import ToolChoiceError, resolve_tool_choice
 from claude_code.sse_assembler import (
     StreamingAnthropicSession,
     build_unary_anthropic_response,
@@ -67,6 +65,10 @@ from claude_code.sse_assembler import (
 from claude_code.openai_sse_assembler import (
     StreamingOpenAISession,
     build_unary_openai_response,
+)
+from claude_code.openai_responses_assembler import (
+    StreamingOpenAIResponsesSession,
+    build_unary_openai_response as build_unary_openai_responses_response,
 )
 from claude_code.compatibility_trace import (
     CompatibilityTrace,
@@ -78,6 +80,21 @@ from config.fallback_config import load_fallback_config
 from config.cursor_client import get_cursor_client_version
 
 logger = ThalamusStructuredLogger.get_logger("pipeline", "DEBUG")
+
+_TOOL_CALL_START_CALLBACK: ContextVar[
+    Callable[[str, str], Awaitable[None] | None] | None
+] = ContextVar("thalamus_tool_call_start_callback", default=None)
+
+
+def _accepts_keyword(callback: Callable[..., Any], keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return True
+    return keyword in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 FATAL_ERROR_PATTERNS: list[re.Pattern] = [
     re.compile(r"unable\s+to\s+reach\s+the\s+model\s+provider", re.I),
@@ -96,6 +113,74 @@ TOOL_JSON_START_MARKERS: list[str] = [
     '{"function"',
 ]
 
+_GENERIC_CAPABILITY_DENIAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:this|the|current)?\s*(?:session|environment|workspace)?\s*"
+        r"(?:has|have|provides?)\s+no\s+(?:available\s+)?(?:tools?|capabilit(?:y|ies))\b",
+        re.I,
+    ),
+    re.compile(
+        r"\btools?\b.{0,48}"
+        r"\b(?:is|are)\s+(?:not\s+available|unavailable|disabled|missing)\b",
+        re.I | re.S,
+    ),
+    re.compile(
+        r"(?:沒有|没有|未提供|不具備|不具备|缺少)(?:任何|可用的?)?(?:工具|能力)"
+    ),
+)
+
+_FILE_CAPABILITY_DENIAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:no|without)\s+(?:available\s+)?(?:file\s+writing|file\s+editing|"
+        r"filesystem|workspace)\s+(?:tools?|capabilit(?:y|ies)|access)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:cannot|can't|unable\s+to)\s+(?:write|create|edit|modify|access)\s+"
+        r"(?:the\s+)?(?:file|filesystem|workspace)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\bworkspace\s+path\b.{0,32}\b(?:unknown|not\s+(?:known|provided)|missing)\b",
+        re.I | re.S,
+    ),
+    re.compile(
+        r"(?:無法|无法|不能)(?:直接)?(?:寫入|写入|建立|创建|編輯|编辑|存取|访问).{0,16}"
+        r"(?:檔案|文件|工作區|工作区)"
+    ),
+    re.compile(
+        r"(?:工作區|工作区)(?:的)?(?:路徑|路径).{0,20}(?:未知|不明|未提供|不知道)"
+    ),
+    re.compile(
+        r"(?:沒有|没有|未提供|缺少)(?:任何|可用的?)?.{0,16}"
+        r"(?:檔案寫入|文件写入|檔案編輯|文件编辑|工作區|工作区).{0,8}(?:工具|能力|存取|访问)?"
+    ),
+)
+
+_TERMINAL_CAPABILITY_DENIAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:no|without)\s+(?:available\s+)?(?:terminal|shell|command)\s+"
+        r"(?:tools?|capabilit(?:y|ies)|access)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(?:cannot|can't|unable\s+to)\s+(?:run|execute|use|access).{0,24}"
+        r"\b(?:terminal|shell|command)\b",
+        re.I | re.S,
+    ),
+    re.compile(r"(?:無法|无法|不能)(?:執行|执行|使用|存取|访问).{0,16}(?:終端|终端|命令)"),
+    re.compile(
+        r"(?:沒有|没有|未提供|缺少)(?:任何|可用的?)?.{0,12}"
+        r"(?:終端|终端|命令列|命令行).{0,8}(?:工具|能力|存取|访问)?"
+    ),
+)
+
+# Cursor can spend several minutes generating a large native tool argument
+# without sending argument deltas. Emit protocol-valid, non-visible events so
+# downstream harnesses do not mistake that quiet period for a dead stream.
+SSE_KEEPALIVE_INTERVAL_SECONDS = 15.0
+RESPONSES_TEXT_ITEM_IDLE_FLUSH_SECONDS = 0.75
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -107,6 +192,70 @@ class PartialStreamConsumptionError(Exception):
     def __init__(self, message: str, consumed: dict) -> None:
         super().__init__(message)
         self.consumed = consumed
+
+
+def _looks_like_false_capability_denial(text: str, advertised_names: list[str]) -> bool:
+    """Detect a tool denial only when the request inventory contradicts it."""
+    if not text or not advertised_names:
+        return False
+
+    inventory = " ".join(advertised_names).lower()
+    has_file_capability = any(
+        token in inventory
+        for token in ("write", "edit", "patch", "file", "filesystem", "workspace")
+    )
+    has_terminal_capability = any(
+        token in inventory
+        for token in ("terminal", "shell", "exec", "command", "bash")
+    )
+
+    for advertised_name in advertised_names:
+        escaped_name = re.escape(advertised_name)
+        exact_name_denials = (
+            re.compile(
+                rf"(?:沒有|没有)(?:(?:任何|可用的?)[\s`'\"「」]*|[\s`'\"「」]*)"
+                rf"{escaped_name}(?:[\s`'\"「」]*(?:工具|能力))?",
+                re.I,
+            ),
+            re.compile(rf"(?:未提供|缺少).{{0,24}}{escaped_name}", re.I | re.S),
+            re.compile(
+                rf"{escaped_name}.{{0,32}}(?:不可用|無法使用|无法使用|未啟用|未启用|不存在)",
+                re.I | re.S,
+            ),
+            re.compile(
+                rf"\b(?:no|without)\b.{{0,32}}\b{escaped_name}\b",
+                re.I | re.S,
+            ),
+            re.compile(
+                rf"\b{escaped_name}\b.{{0,32}}\b(?:unavailable|not\s+available|disabled|missing)\b",
+                re.I | re.S,
+            ),
+        )
+        if any(pattern.search(text) for pattern in exact_name_denials):
+            return True
+
+    if any(pattern.search(text) for pattern in _GENERIC_CAPABILITY_DENIAL_PATTERNS):
+        return True
+    if has_file_capability and any(
+        pattern.search(text) for pattern in _FILE_CAPABILITY_DENIAL_PATTERNS
+    ):
+        return True
+    return has_terminal_capability and any(
+        pattern.search(text) for pattern in _TERMINAL_CAPABILITY_DENIAL_PATTERNS
+    )
+
+
+def _render_capability_denial_correction(advertised_names: list[str]) -> str:
+    names = json.dumps(advertised_names, ensure_ascii=False)
+    return (
+        "Correction: the preceding answer incorrectly denied client capabilities. "
+        f"This request advertises these callable client functions: {names}. "
+        "That inventory is authoritative. Relative paths are actionable within the "
+        "client's current workspace; do not ask for an absolute workspace path. "
+        "Continue the original request now. If action is required, invoke one or more "
+        "functions using an exact advertised name and its exact schema. Do not repeat "
+        "the denial or emit another status-only preamble."
+    )
 
 
 def _to_api_error_body(message: str, error_type: str = "api_error") -> dict:
@@ -204,7 +353,18 @@ class ToolJsonAwareTextForwarder:
         self._pending_buffer = ""
         self._safe_text_consumed_len = 0
         self.stopped_due_to_tool_json = False
-        self._tail_buffer_len = max(len(marker) for marker in TOOL_JSON_START_MARKERS)
+
+    @staticmethod
+    def _possible_marker_suffix_len(text: str) -> int:
+        """Keep only a suffix that could still become a tool marker."""
+        longest = 0
+        for marker in TOOL_JSON_START_MARKERS:
+            max_length = min(len(text), len(marker) - 1)
+            for length in range(max_length, 0, -1):
+                if text.endswith(marker[:length]):
+                    longest = max(longest, length)
+                    break
+        return longest
 
     def _process_safe_chunk(self, chunk: str) -> str | None:
         if not chunk:
@@ -225,18 +385,18 @@ class ToolJsonAwareTextForwarder:
             return None
 
         self._pending_buffer += delta
-        split_idx = _find_first_tool_json_start_index(self.full_text_seen)
+        split_idx = _find_first_tool_json_start_index(self._pending_buffer)
         if split_idx >= 0:
             self.stopped_due_to_tool_json = True
-            remaining_safe = max(0, split_idx - self._safe_text_consumed_len)
-            if remaining_safe > 0:
-                return self._process_safe_chunk(
-                    self._pending_buffer[:remaining_safe]
-                )
+            if split_idx > 0:
+                safe = self._pending_buffer[:split_idx]
+                self._pending_buffer = ""
+                return self._process_safe_chunk(safe)
             self._pending_buffer = ""
             return None
 
-        safe_flush_len = max(0, len(self._pending_buffer) - self._tail_buffer_len)
+        keep_len = self._possible_marker_suffix_len(self._pending_buffer)
+        safe_flush_len = len(self._pending_buffer) - keep_len
         if safe_flush_len > 0:
             result = self._process_safe_chunk(self._pending_buffer[:safe_flush_len])
             self._pending_buffer = self._pending_buffer[safe_flush_len:]
@@ -260,122 +420,6 @@ class ToolJsonAwareTextForwarder:
                 result_parts.append(r)
 
         return "".join(result_parts) if result_parts else None
-
-
-# ---------------------------------------------------------------------------
-# Tool-call requirement detection
-# ---------------------------------------------------------------------------
-
-
-def is_tool_call_explicitly_required(messages: list[dict]) -> bool:
-    """Check if the last user message explicitly demands a tool call."""
-    if not messages:
-        return False
-
-    last_user_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "user":
-            last_user_idx = i
-            break
-    if last_user_idx < 0:
-        return False
-
-    content = messages[last_user_idx].get("content", "")
-    if isinstance(content, list):
-        content = " ".join(
-            (p.get("text", "") if isinstance(p, dict) else str(p)) for p in content
-        )
-    user_text = str(content).lower()
-    if not user_text:
-        return False
-
-    general = [
-        re.compile(r"must\s+call\s+at\s+least\s+one\s+tool"),
-        re.compile(r"you\s+must\s+output\s+a\s+valid\s+tool_calls\s+json"),
-        re.compile(r"必须.*至少.*调用.*工具"),
-    ]
-    if any(p.search(user_text) for p in general):
-        return True
-
-    first_msg = [
-        re.compile(r"first\s+(assistant\s+)?message\s+must\s+be\s+tool-?call\s+json"),
-        re.compile(r"第一条.*assistant.*消息.*必须.*tool-?call"),
-        re.compile(r"第一条.*消息.*必须.*tool-?call"),
-    ]
-    if not any(p.search(user_text) for p in first_msg):
-        return False
-
-    has_assistant_before = any(
-        m.get("role") == "assistant" for m in messages[:last_user_idx]
-    )
-    return not has_assistant_before
-
-
-def _is_current_turn_after_tool_result(messages: list[dict]) -> bool:
-    """Return whether the trailing tool result matches the prior assistant turn."""
-    if not messages or messages[-1].get("role") != "tool":
-        return False
-
-    result_id = messages[-1].get("tool_call_id")
-    if not isinstance(result_id, str) or not result_id.strip():
-        return False
-
-    for message in reversed(messages[:-1]):
-        role = message.get("role")
-        if role == "tool":
-            continue
-        if role != "assistant":
-            return False
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            return False
-        return any(
-            isinstance(tool_call, dict)
-            and isinstance(tool_call.get("id"), str)
-            and bool(tool_call["id"].strip())
-            and tool_call["id"] == result_id
-            for tool_call in tool_calls
-        )
-    return False
-
-
-def _should_accept_final_text_without_continuation(
-    messages: list[dict],
-    text: str,
-) -> bool:
-    """Accept a nonempty response immediately following the current tool result."""
-    return _is_current_turn_after_tool_result(messages) and bool((text or "").strip())
-
-
-def _message_content_to_text(content: Any) -> str:
-    if isinstance(content, list):
-        return " ".join(
-            (part.get("text", "") if isinstance(part, dict) else str(part))
-            for part in content
-        )
-    return str(content or "")
-
-
-def _last_user_text(messages: list[dict]) -> str:
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            return _message_content_to_text(msg.get("content", ""))
-    return ""
-
-
-def _tools_for_continuation(tools: list[dict], tool_names: list[str]) -> list[dict]:
-    """Add minimal schemas only when callers supplied names without schemas."""
-    known_names = {
-        (tool.get("function") or tool).get("name")
-        for tool in tools
-        if (tool.get("function") or tool).get("name")
-    }
-    missing = [
-        {"name": name, "input_schema": {"type": "object"}}
-        for name in tool_names
-        if name and name not in known_names
-    ]
-    return [*tools, *missing]
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +506,18 @@ class _ProtocolStreamDecoder:
 
 
 def _parse_tool_calls_from_consumed(consumed: dict) -> tuple[list[DecodedToolCandidate], str]:
-    """Return only candidates decoded by the active protocol adapter."""
+    """Prefer structured Cursor calls, then the active text protocol."""
+    native_calls = consumed.get("native_tool_calls") or ()
+    if native_calls:
+        return [
+            DecodedToolCandidate(
+                call_id=call.call_id,
+                raw_name=call.name,
+                arguments=call.arguments,
+                source_lane="native",
+            )
+            for call in native_calls
+        ], "native"
     candidates = list(consumed.get("_protocol_candidates") or ())
     source = candidates[0].source_lane if candidates else ""
     return candidates, source
@@ -477,16 +532,6 @@ def _safe_final_text_for_stream(full_text: str, has_tool_calls: bool) -> str:
     if not has_tool_calls:
         return full_text
     return extract_text_before_json(full_text)
-
-
-def _is_internal_task_complete_tool_call(tool_call: dict) -> bool:
-    function = tool_call.get("function")
-    return isinstance(function, dict) and function.get("name") == "task_complete"
-
-
-def _strip_internal_task_complete_tool_calls(tool_calls: list[dict]) -> list[dict]:
-    """Prevent internal completion controls from entering public assemblers."""
-    return [tool_call for tool_call in tool_calls if not _is_internal_task_complete_tool_call(tool_call)]
 
 
 def _is_incomplete_composer_marker(text: str) -> bool:
@@ -511,6 +556,82 @@ def _is_interrupted_tool_json(consumed: dict, is_composer: bool = False) -> bool
 class StreamCallbacks:
     on_text_delta: Callable[[str], Awaitable[None] | None] | None = None
     on_thinking_delta: Callable[[str], Awaitable[None] | None] | None = None
+    on_tool_call_start: (
+        Callable[[str, str], Awaitable[None] | None] | None
+    ) = None
+
+
+@dataclass
+class _SemanticLatencyTracker:
+    """Measure first downstream-meaningful events independently of transport.
+
+    ``first_chunk_latency_ms`` is an established metrics key used by callers and
+    fixtures, but a protobuf/Agent event can contain only control metadata.  Do
+    not treat it as time-to-first-token.  These measurements are taken where the
+    pipeline can actually identify text, reasoning, or a client tool name.
+    """
+
+    started_at: float
+    first_text_latency_ms: float | None = None
+    first_reasoning_latency_ms: float | None = None
+    first_tool_identity_latency_ms: float | None = None
+
+    @classmethod
+    def start(cls) -> "_SemanticLatencyTracker":
+        return cls(started_at=time.monotonic())
+
+    def _elapsed_ms(self) -> float:
+        return (time.monotonic() - self.started_at) * 1000
+
+    def mark_text(self, value: str) -> None:
+        if value and self.first_text_latency_ms is None:
+            self.first_text_latency_ms = self._elapsed_ms()
+
+    def mark_reasoning(self, value: str) -> None:
+        if value and self.first_reasoning_latency_ms is None:
+            self.first_reasoning_latency_ms = self._elapsed_ms()
+
+    def mark_tool_identity(self, call_id: str, name: str) -> None:
+        if call_id and name and self.first_tool_identity_latency_ms is None:
+            self.first_tool_identity_latency_ms = self._elapsed_ms()
+
+    def metrics(self) -> dict[str, float]:
+        values = {
+            "first_text_latency_ms": self.first_text_latency_ms,
+            "first_reasoning_latency_ms": self.first_reasoning_latency_ms,
+            "first_tool_identity_latency_ms": self.first_tool_identity_latency_ms,
+        }
+        semantic_values = [value for value in values.values() if value is not None]
+        return {
+            **{
+                key: value if value is not None else -1
+                for key, value in values.items()
+            },
+            "first_semantic_latency_ms": (
+                min(semantic_values) if semantic_values else -1
+            ),
+        }
+
+    def attach(self, consumed: dict) -> dict:
+        consumed.setdefault("metrics", {}).update(self.metrics())
+        return consumed
+
+
+def _format_stream_metrics(metrics: dict[str, Any]) -> str:
+    """Format latency names without presenting a control chunk as a token."""
+
+    def value(name: str) -> float:
+        candidate = metrics.get(name, -1)
+        return float(candidate) if isinstance(candidate, (int, float)) else -1
+
+    return (
+        f"chunks={metrics.get('chunk_count', 0)} "
+        f"first_chunk_ms={value('first_chunk_latency_ms'):.0f} "
+        f"first_semantic_ms={value('first_semantic_latency_ms'):.0f} "
+        f"first_text_ms={value('first_text_latency_ms'):.0f} "
+        f"first_reasoning_ms={value('first_reasoning_latency_ms'):.0f} "
+        f"first_tool_identity_ms={value('first_tool_identity_latency_ms'):.0f}"
+    )
 
 
 @dataclass(frozen=True)
@@ -614,7 +735,10 @@ def _is_fatal_stream_error(error: Any) -> bool:
 
 
 def build_cursor_stream_params(
-    token: str, messages: list[dict], model: str
+    token: str,
+    messages: list[dict],
+    model: str,
+    tools: list[dict] | None = None,
 ) -> tuple[str, dict[str, str], bytes]:
     """Build H2 path, headers, and protobuf body for a Cursor streaming request."""
     chosen_auth = strip_cursor_user_prefix(token)
@@ -624,7 +748,7 @@ def build_cursor_stream_params(
     client_version = get_cursor_client_version()
 
     body = build_gzip_framed_protobuf_chat_request_body(
-        messages, model, agent_mode=True
+        messages, model, agent_mode=True, tools=tools
     )
     is_gzipped = body[0] == 0x01
 
@@ -733,6 +857,7 @@ async def consume_stream(
     splitter = _ThinkTagSplitter()
     composer_proc = ComposerStreamProcessor() if composer else None
     composer_tool_calls: list[dict] = []
+    native_tool_calls: dict[str, Any] = {}
     interrupted_tool_state = ""
     text = ""
     thinking = ""
@@ -743,7 +868,8 @@ async def consume_stream(
     chunk_count = 0
     text_delta_count = 0
     thinking_delta_count = 0
-    stream_start = time.monotonic()
+    latency_tracker = _SemanticLatencyTracker.start()
+    stream_start = latency_tracker.started_at
     first_chunk_latency_ms: float | None = None
 
     def _build_consumed_result() -> dict:
@@ -755,6 +881,7 @@ async def consume_stream(
             "text": text,
             "thinking": thinking,
             "composer_tool_calls": composer_tool_calls,
+            "native_tool_calls": list(native_tool_calls.values()),
             "interrupted_tool_state": interrupted_tool_state,
             "errors": filtered_errors,
             "context_remaining_percent": context_remaining_percent,
@@ -767,24 +894,32 @@ async def consume_stream(
                 "text_delta_count": text_delta_count,
                 "thinking_delta_count": thinking_delta_count,
                 "protocol_error_count": len(filtered_errors),
+                **latency_tracker.metrics(),
             },
         }
 
     def _apply_composer_emit(emit) -> None:
         nonlocal text, thinking, had_content, text_delta_count, thinking_delta_count
         if emit.thinking:
+            latency_tracker.mark_reasoning(emit.thinking)
             thinking += emit.thinking
             thinking_delta_count += 1
             had_content = True
             if on_thinking_delta:
                 on_thinking_delta(emit.thinking)
         if emit.text:
+            latency_tracker.mark_text(emit.text)
             text += emit.text
             text_delta_count += 1
             had_content = True
             if on_text_delta:
                 on_text_delta(emit.text)
         if emit.tool_calls:
+            first_call = emit.tool_calls[0]
+            latency_tracker.mark_tool_identity(
+                str(first_call.get("id") or first_call.get("name") or "composer"),
+                str(first_call.get("name") or ""),
+            )
             composer_tool_calls.extend(emit.tool_calls)
             had_content = True
 
@@ -796,6 +931,15 @@ async def consume_stream(
             logger.debug(f"[consume] chunk#{chunk_count} len={len(chunk)} hex_head={chunk[:20].hex()}")
 
             result = parser.parse(chunk)
+            complete_native_call = False
+            for call in result.native_tool_calls:
+                latency_tracker.mark_tool_identity(call.call_id, call.name)
+                previous = native_tool_calls.get(call.call_id)
+                if previous is None or len(call.raw_arguments) >= len(previous.raw_arguments):
+                    native_tool_calls[call.call_id] = call
+                if call.is_last:
+                    complete_native_call = True
+                    had_content = True
             if (
                 context_remaining_percent is None
                 and result.context_remaining_percent is not None
@@ -817,9 +961,12 @@ async def consume_stream(
                     _apply_composer_emit(composer_proc.feed_thinking(result.thinking))
                 if result.text:
                     _apply_composer_emit(composer_proc.feed_content(result.text))
+                if complete_native_call:
+                    break
                 continue
 
             if result.thinking:
+                latency_tracker.mark_reasoning(result.thinking)
                 thinking += result.thinking
                 thinking_delta_count += 1
                 had_content = True
@@ -830,6 +977,7 @@ async def consume_stream(
                 think_part, text_part = splitter.feed(result.text)
 
                 if think_part:
+                    latency_tracker.mark_reasoning(think_part)
                     thinking += think_part
                     thinking_delta_count += 1
                     had_content = True
@@ -837,12 +985,15 @@ async def consume_stream(
                         on_thinking_delta(think_part)
 
                 if text_part:
+                    latency_tracker.mark_text(text_part)
                     text += text_part
                     text_delta_count += 1
                     had_content = True
                     if on_text_delta:
                         on_text_delta(text_part)
                     logger.debug(f"[consume] text so far ({len(text)} chars): ...{text[-200:]}")
+            if complete_native_call:
+                break
     except Exception as exc:
         if composer_proc is not None:
             interrupted_tool_state = composer_proc.pending_tool_block()
@@ -850,12 +1001,14 @@ async def consume_stream(
                 _apply_composer_emit(composer_proc.flush())
         flush_think, flush_text = splitter.flush()
         if flush_think:
+            latency_tracker.mark_reasoning(flush_think)
             thinking += flush_think
             thinking_delta_count += 1
             had_content = True
             if on_thinking_delta:
                 on_thinking_delta(flush_think)
         if flush_text:
+            latency_tracker.mark_text(flush_text)
             text += flush_text
             text_delta_count += 1
             had_content = True
@@ -872,12 +1025,14 @@ async def consume_stream(
 
     flush_think, flush_text = splitter.flush()
     if flush_think:
+        latency_tracker.mark_reasoning(flush_think)
         thinking += flush_think
         thinking_delta_count += 1
         had_content = True
         if on_thinking_delta:
             on_thinking_delta(flush_think)
     if flush_text:
+        latency_tracker.mark_text(flush_text)
         text += flush_text
         text_delta_count += 1
         had_content = True
@@ -905,19 +1060,26 @@ async def _call_cursor_direct(
     compact_tools: bool = False,
     requested_model: str | None = None,
     client_format: str | None = None,
+    tool_choice: dict[str, Any] | str | None = None,
 ) -> dict:
-    """Call Cursor API with tool schema injection, continuation retry, and fallback."""
+    """Call Cursor API with strict tool decoding, one repair, and fallback."""
     start_time = time.monotonic()
     request_id = f"cc_{uuid.uuid4().hex[:12]}"
 
     base_messages = list(messages)
-    has_valid_tools = bool(valid_tool_names)
-    all_valid_names = list(valid_tool_names) + (["task_complete"] if has_valid_tools else [])
+    choice_policy = resolve_tool_choice(tool_choice, valid_tool_names)
+    effective_tool_names = choice_policy.permitted_names(valid_tool_names)
+    resumable_tool_names = resumable_agent_tool_names(base_messages, auth_token)
+    if not effective_tool_names and resumable_tool_names:
+        effective_tool_names = list(resumable_tool_names)
+    effective_tools = choice_policy.filter_tools(tools)
+    has_valid_tools = bool(effective_tool_names)
 
     fallback_cfg = load_fallback_config()
     tried_models: list[str] = []
     current_model = model
     repair_attempted = False
+    capability_retry_attempted = False
     fallback_reason: str | None = None
     last_attempt_trace: CompatibilityTrace | None = None
     last_context_remaining_percent: float | None = None
@@ -926,11 +1088,18 @@ async def _call_cursor_direct(
         attempt_number = len(tried_models) + 1
         protocol = classify_tool_protocol(current_model)
         adapter = create_protocol_adapter(protocol)
-        attempt_messages = inject_tool_prompt_into_messages(
-            list(base_messages),
-            tools,
-            compact_tools=compact_tools,
-            adapter=adapter,
+        use_agent_api = bool(effective_tools) or bool(resumable_tool_names)
+        attempt_messages = (
+            list(base_messages)
+            if use_agent_api
+            else inject_tool_prompt_into_messages(
+                list(base_messages),
+                effective_tools,
+                compact_tools=compact_tools,
+                adapter=adapter,
+                tool_choice=tool_choice,
+                advertised_tool_names=effective_tool_names,
+            )
         )
         logger.info(
             f"[{request_id}] Calling Cursor direct | model={current_model} | tools={len(valid_tool_names)} | msgs={len(attempt_messages)} | attempt={len(tried_models) + 1}"
@@ -938,6 +1107,7 @@ async def _call_cursor_direct(
 
         attempt_start = time.monotonic()
         is_composer = protocol == ToolProtocol.COMPOSER_MARKER_V1
+        replay_safe = True
 
         req_payload_path = log_llm_request(
             request_id, current_model, attempt_messages,
@@ -945,14 +1115,63 @@ async def _call_cursor_direct(
         )
 
         callbacks = StreamCallbacks(
-            on_text_delta=None if compact_tools and has_valid_tools else on_stream_delta,
+            on_text_delta=on_stream_delta,
             on_thinking_delta=on_thinking_delta,
+            on_tool_call_start=_TOOL_CALL_START_CALLBACK.get(),
         )
 
         async def open_and_consume(attempt_messages: list[dict]) -> dict:
+            if use_agent_api:
+                latency_tracker = _SemanticLatencyTracker.start()
+
+                def on_agent_text(delta: str) -> Any:
+                    nonlocal replay_safe
+                    latency_tracker.mark_text(delta)
+                    if delta:
+                        replay_safe = False
+                    if callbacks.on_text_delta is not None:
+                        return callbacks.on_text_delta(delta)
+                    return None
+
+                def on_agent_reasoning(delta: str) -> Any:
+                    nonlocal replay_safe
+                    latency_tracker.mark_reasoning(delta)
+                    if delta:
+                        replay_safe = False
+                    if callbacks.on_thinking_delta is not None:
+                        return callbacks.on_thinking_delta(delta)
+                    return None
+
+                def on_agent_tool_start(call_id: str, name: str) -> Any:
+                    nonlocal replay_safe
+                    latency_tracker.mark_tool_identity(call_id, name)
+                    replay_safe = False
+                    if callbacks.on_tool_call_start is not None:
+                        return callbacks.on_tool_call_start(call_id, name)
+                    return None
+
+                callback_kwargs: dict[str, Any] = {}
+                if _accepts_keyword(call_cursor_agent, "on_tool_call_start"):
+                    callback_kwargs["on_tool_call_start"] = on_agent_tool_start
+                if _accepts_keyword(call_cursor_agent, "client_request_id"):
+                    callback_kwargs["client_request_id"] = request_id
+                consumed = await call_cursor_agent(
+                    attempt_messages,
+                    current_model,
+                    effective_tools,
+                    auth_token,
+                    on_text_delta=on_agent_text,
+                    on_thinking_delta=on_agent_reasoning,
+                    **callback_kwargs,
+                )
+                return latency_tracker.attach(consumed)
+
             stream_decoder = _ProtocolStreamDecoder(create_protocol_adapter(protocol))
 
             def forward_protocol_result(result: ProtocolDecodeResult) -> None:
+                nonlocal replay_safe
+                if result.visible_text or result.thinking_text:
+                    replay_safe = False
                 if result.visible_text and callbacks.on_text_delta:
                     callbacks.on_text_delta(result.visible_text)
                 if result.thinking_text and callbacks.on_thinking_delta:
@@ -965,7 +1184,10 @@ async def _call_cursor_direct(
                 forward_protocol_result(stream_decoder.feed("reasoning", delta))
 
             path, headers, body = build_cursor_stream_params(
-                auth_token, attempt_messages, current_model
+                auth_token,
+                attempt_messages,
+                current_model,
+                effective_tools,
             )
             try:
                 async with open_streaming_h2_request(path, headers, body) as stream_iter:
@@ -990,14 +1212,43 @@ async def _call_cursor_direct(
             nonlocal repair_attempted
             repair_attempted = True
 
-        render_tools = _tools_for_continuation(tools, all_valid_names)
-
         def render_repair(partial: dict) -> str:
+            parsed_candidates, _ = _parse_tool_calls_from_consumed(partial)
+            validation = validate_tool_candidates(
+                parsed_candidates,
+                allowed_names=set(effective_tool_names),
+            )
+            if validation.rejected and not validation.accepted:
+                rejected_names = sorted(
+                    {rejection.raw_name for rejection in validation.rejected if rejection.raw_name}
+                )
+                return (
+                    "The previous native tool call was rejected because its function "
+                    f"name was not in this request's client inventory: {rejected_names}. "
+                    "Do not invoke another native Cursor or MCP server tool. Instead, emit "
+                    "exactly one raw JSON object in this form and no other prose: "
+                    '{"type":"tool_use","id":"toolu_repair","name":"<exact advertised '
+                    'client function name>","input":{<arguments matching its exact schema>}}. '
+                    "Choose the name only from the client functions already advertised in "
+                    "the system tool manifest. Do not repeat the status preamble."
+                )
             interrupted_state = partial.get("interrupted_tool_state") or "\n".join(
                 value for value in (partial.get("text"), partial.get("thinking")) if value
             )
             repair_adapter = create_protocol_adapter(protocol)
-            return repair_adapter.render_repair(render_tools, interrupted_state)
+            return repair_adapter.render_repair(effective_tools, interrupted_state)
+
+        def needs_protocol_repair(value: dict) -> bool:
+            if value.get("_protocol_incomplete"):
+                return True
+            parsed_candidates, _ = _parse_tool_calls_from_consumed(value)
+            if not parsed_candidates:
+                return False
+            validation = validate_tool_candidates(
+                parsed_candidates,
+                allowed_names=set(effective_tool_names),
+            )
+            return bool(validation.rejected and not validation.accepted)
 
         upstream_attempt_number = 0
 
@@ -1014,8 +1265,7 @@ async def _call_cursor_direct(
             )
             validation = validate_tool_candidates(
                 parsed_candidates,
-                allowed_names=set(valid_tool_names),
-                allow_internal_task_complete=has_valid_tools,
+                allowed_names=set(effective_tool_names),
             )
             accepted_names = tuple(
                 (tool_call.get("function") or {}).get("name", "")
@@ -1052,25 +1302,70 @@ async def _call_cursor_direct(
                 messages=attempt_messages,
                 open_and_consume=open_and_consume,
                 render_repair=render_repair,
-                allow_repair=has_valid_tools and not repair_attempted,
+                allow_repair=(
+                    has_valid_tools and not repair_attempted and not use_agent_api
+                ),
                 is_composer=is_composer,
-                is_protocol_incomplete=lambda value: bool(value.get("_protocol_incomplete")),
+                is_protocol_incomplete=needs_protocol_repair,
                 on_repair_attempt=mark_repair_attempted,
                 on_upstream_attempt=trace_upstream_attempt,
             )
             consumed = attempt.consumed
-            last_context_remaining_percent = consumed.get("context_remaining_percent")
             repair_attempted = repair_attempted or attempt.repair_attempted
             if attempt.repair_attempted:
                 logger.info(
                     f"[{request_id}] Interrupted tool JSON repair consumed | "
                     f"text_len={len(consumed['text'])}"
                 )
+
+            parsed_candidates, _ = _parse_tool_calls_from_consumed(consumed)
+            visible_text = consumed.get("_protocol_visible_text", consumed.get("text", ""))
+            if (
+                has_valid_tools
+                and not use_agent_api
+                and not capability_retry_attempted
+                and not parsed_candidates
+                and _looks_like_false_capability_denial(visible_text, effective_tool_names)
+            ):
+                capability_retry_attempted = True
+                logger.warn(
+                    f"[{request_id}] False client-capability denial detected; "
+                    "retrying once with the authoritative request tool inventory"
+                )
+                correction_messages = [
+                    *attempt_messages,
+                    {"role": "assistant", "content": visible_text},
+                    {
+                        "role": "user",
+                        "content": _render_capability_denial_correction(effective_tool_names),
+                    },
+                ]
+                retry = await _consume_attempt_with_repair(
+                    messages=correction_messages,
+                    open_and_consume=open_and_consume,
+                    render_repair=render_repair,
+                    allow_repair=has_valid_tools and not repair_attempted,
+                    is_composer=is_composer,
+                    is_protocol_incomplete=needs_protocol_repair,
+                    on_repair_attempt=mark_repair_attempted,
+                    on_upstream_attempt=lambda value, is_repair, result, latency: (
+                        trace_upstream_attempt(value, True, result, latency)
+                    ),
+                )
+                consumed = retry.consumed
+                repair_attempted = repair_attempted or retry.repair_attempted
+
+            last_context_remaining_percent = consumed.get("context_remaining_percent")
+            if "replay_safe" in consumed:
+                replay_safe = replay_safe and bool(consumed["replay_safe"])
+            else:
+                replay_safe = replay_safe and not bool(consumed.get("had_content"))
         except Exception as exc:
             err_msg = str(exc)
             logger.error(f"[{request_id}] Connection/stream error: {err_msg}")
             latency = int((time.monotonic() - attempt_start) * 1000)
-            if fallback_cfg.should_fallback(err_msg):
+            fallback_requested = fallback_cfg.should_fallback(err_msg)
+            if fallback_requested and replay_safe:
                 tried_models.append(current_model)
                 next_model = fallback_cfg.select_next_model(model, tried_models)
                 if next_model:
@@ -1080,6 +1375,10 @@ async def _call_cursor_direct(
                     fallback_reason = "transport_error"
                     current_model = next_model
                     continue
+            elif fallback_requested:
+                logger.warn(
+                    f"[{request_id}] Suppressing model fallback after observed work"
+                )
             res_payload_path = log_llm_response(
                 request_id, current_model, "", error=err_msg, latency_ms=latency,
             )
@@ -1097,7 +1396,6 @@ async def _call_cursor_direct(
                 "error": err_msg,
                 "status": 503,
                 "fallback_attempts": len(tried_models),
-            "context_remaining_percent": last_context_remaining_percent,
                 "context_remaining_percent": last_context_remaining_percent,
                 "model": current_model,
             }
@@ -1110,9 +1408,12 @@ async def _call_cursor_direct(
         if should_fallback_from_stream:
             err_detail = _first_error_detail(consumed["errors"])
             logger.warn(
-                f"[{request_id}] Stream error: {err_detail} | had_content={consumed['had_content']} fatal={consumed['has_fatal_error']}"
+                f"[{request_id}] Stream error: {err_detail} | "
+                f"had_content={consumed['had_content']} "
+                f"fatal={consumed['has_fatal_error']} replay_safe={replay_safe}"
             )
-            if fallback_cfg.should_fallback(err_detail):
+            fallback_requested = fallback_cfg.should_fallback(err_detail)
+            if fallback_requested and replay_safe:
                 tried_models.append(current_model)
                 next_model = fallback_cfg.select_next_model(model, tried_models)
                 if next_model:
@@ -1124,6 +1425,10 @@ async def _call_cursor_direct(
                     )
                     current_model = next_model
                     continue
+            elif fallback_requested:
+                logger.warn(
+                    f"[{request_id}] Suppressing model fallback after observed work"
+                )
             if last_attempt_trace is not None:
                 _emit_terminal_compatibility_trace(
                     last_attempt_trace,
@@ -1134,7 +1439,6 @@ async def _call_cursor_direct(
                 "error": err_detail,
                 "status": 503,
                 "fallback_attempts": len(tried_models),
-            "context_remaining_percent": last_context_remaining_percent,
                 "context_remaining_percent": last_context_remaining_percent,
                 "model": current_model,
             }
@@ -1146,22 +1450,20 @@ async def _call_cursor_direct(
         logger.info(
             f"[{request_id}] Stream consumed | text_len={len(consumed['text'])} thinking_len={len(consumed['thinking'])} "
             f"errors={len(consumed['errors'])} "
-            f"chunks={metrics['chunk_count']} first_token_ms={metrics['first_chunk_latency_ms']:.0f}"
+            f"{_format_stream_metrics(metrics)}"
         )
 
         converted_tcs: list[dict] = []
+        parsed_tcs: list[DecodedToolCandidate] = []
         parsed_source = ""
-        if all_valid_names:
+        if effective_tool_names:
             parsed_tcs, parsed_source = _parse_tool_calls_from_consumed(consumed)
             if parsed_tcs:
                 validation = validate_tool_candidates(
                     parsed_tcs,
-                    allowed_names=set(valid_tool_names),
-                    allow_internal_task_complete=has_valid_tools,
+                    allowed_names=set(effective_tool_names),
                 )
                 converted_tcs = list(validation.accepted)
-                if converted_tcs:
-                    converted_tcs = _fix_garbled_paths_in_tool_calls(converted_tcs)
                 if validation.rejected:
                     logger.warn(
                         f"[{request_id}] Rejected decoded tool calls: "
@@ -1183,6 +1485,10 @@ async def _call_cursor_direct(
             extra={
                 "thinking_len": len(consumed["thinking"]),
                 "chunks": metrics["chunk_count"],
+                # Numeric-only timing/counter telemetry.  Keep the established
+                # first_chunk key for consumers while exposing semantic timing
+                # under names that cannot be mistaken for token latency.
+                "stream_metrics": dict(metrics),
             },
         )
         log_llm_api_call(
@@ -1191,51 +1497,6 @@ async def _call_cursor_direct(
             attempt_latency, req_payload_path, res_payload_path,
             error=_first_error_detail(consumed["errors"]) if consumed["errors"] else None,
         )
-
-        if not has_valid_tools:
-            _emit_terminal_compatibility_trace(
-                attempt_trace, "final_text", int((time.monotonic() - start_time) * 1000)
-            )
-            return {
-                "text": clean_text,
-                "thinking": clean_thinking,
-                "model": current_model,
-                "fallback_attempts": len(tried_models),
-            "context_remaining_percent": last_context_remaining_percent,
-                "context_remaining_percent": last_context_remaining_percent,
-                "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
-            }
-
-        # Filter out task_complete from final tool_calls (it's a pseudo-tool)
-        if converted_tcs:
-            final_tcs = []
-            task_complete_text = ""
-            for tc in converted_tcs:
-                if _is_internal_task_complete_tool_call(tc):
-                    if is_task_complete_call(tc):
-                        task_complete_text = extract_task_complete_result(tc)
-                        logger.info(f"[{request_id}] task_complete in final batch: {task_complete_text[:200]}")
-                    else:
-                        logger.warn(f"[{request_id}] Discarded malformed task_complete")
-                    continue
-                final_tcs.append(tc)
-
-            if task_complete_text and not final_tcs:
-                text_before = _safe_text_for_tool_source(consumed, parsed_source)
-                _emit_terminal_compatibility_trace(
-                    attempt_trace, "task_complete", int((time.monotonic() - start_time) * 1000)
-                )
-                return {
-                    "text": text_before if text_before else task_complete_text,
-                    "task_complete_text": task_complete_text,
-                    "thinking": clean_thinking,
-                    "model": current_model,
-                    "fallback_attempts": len(tried_models),
-            "context_remaining_percent": last_context_remaining_percent,
-                "context_remaining_percent": last_context_remaining_percent,
-                    "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
-                }
-            converted_tcs = final_tcs
 
         if converted_tcs:
             raw_names = [(tc.get("function") or {}).get("name", "?") for tc in converted_tcs]
@@ -1251,182 +1512,21 @@ async def _call_cursor_direct(
                 "model": current_model,
                 "stats": {"passed": len(converted_tcs), "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
                 "fallback_attempts": len(tried_models),
-            "context_remaining_percent": last_context_remaining_percent,
                 "context_remaining_percent": last_context_remaining_percent,
             }
 
-        if not parsed_tcs and _should_accept_final_text_without_continuation(
-            messages,
-            clean_text,
-        ):
-            logger.info(f"[{request_id}] Accepting final text after prior tool result")
-            _emit_terminal_compatibility_trace(
-                attempt_trace, "final_text", int((time.monotonic() - start_time) * 1000)
-            )
-            return {
-                "text": clean_text,
-                "thinking": clean_thinking,
-                "model": current_model,
-                "fallback_attempts": len(tried_models),
-            "context_remaining_percent": last_context_remaining_percent,
-                "context_remaining_percent": last_context_remaining_percent,
-                "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
-            }
-
-        # ── Continuation retry: no tool_calls AND no task_complete → request action ──
-        # Compact OpenAI/Hermes sessions may finish with plain text after tool results;
-        # the guard above accepts those final answers before reaching this retry path.
-        first_text = clean_text
-        first_thinking = clean_thinking
-
-        cont_retries = 0
-        continuation_failed = False
-        accumulated_text = first_text
-        continuation_messages = list(attempt_messages)
-        user_intent = _last_user_text(base_messages)
-
-        while cont_retries < MAX_CONTINUATION_RETRIES:
-            cont_retries += 1
-            logger.info(
-                f"[{request_id}] Continuation retry {cont_retries}/{MAX_CONTINUATION_RETRIES} | "
-                f"text_len={len(accumulated_text)} | no tool_calls, no task_complete"
-            )
-
-            continuation_adapter = create_protocol_adapter(protocol)
-            continuation_messages = _merge_consecutive_same_role(
-                [
-                    *continuation_messages,
-                    {"role": "assistant", "content": accumulated_text},
-                    {
-                        "role": "user",
-                        "content": continuation_adapter.render_continuation(
-                            render_tools,
-                            user_intent,
-                            accumulated_text,
-                        ),
-                    },
-                ]
-            )
-
-            try:
-                continuation_attempt = await _consume_attempt_with_repair(
-                    messages=continuation_messages,
-                    open_and_consume=open_and_consume,
-                    render_repair=render_repair,
-                    allow_repair=has_valid_tools and not repair_attempted,
-                    is_composer=is_composer,
-                    is_protocol_incomplete=lambda value: bool(value.get("_protocol_incomplete")),
-                    on_repair_attempt=mark_repair_attempted,
-                    on_upstream_attempt=trace_upstream_attempt,
-                )
-                consumed_c = continuation_attempt.consumed
-                last_context_remaining_percent = consumed_c.get("context_remaining_percent")
-                assert last_attempt_trace is not None
-                continuation_trace = last_attempt_trace
-                repair_attempted = repair_attempted or continuation_attempt.repair_attempted
-                if continuation_attempt.repair_attempted:
-                    logger.info(f"[{request_id}] Continuation tool JSON repair consumed")
-            except Exception as exc_c:
-                logger.error(f"[{request_id}] Continuation retry stream error: {exc_c}")
-                continuation_failed = True
-                break
-
-            if consumed_c["has_fatal_error"] or (consumed_c["errors"] and not consumed_c["had_content"]):
-                logger.warn(f"[{request_id}] Continuation retry got fatal error")
-                continuation_failed = True
-                break
-
-            retry_text = consumed_c.get("_protocol_visible_text", consumed_c["text"])
-            logger.info(f"[{request_id}] Continuation retry response | text_len={len(retry_text)}")
-
-            retry_tcs: list[dict] = []
-            parsed_retry, retry_source = _parse_tool_calls_from_consumed(consumed_c)
-            if parsed_retry:
-                retry_validation = validate_tool_candidates(
-                    parsed_retry,
-                    allowed_names=set(valid_tool_names),
-                    allow_internal_task_complete=has_valid_tools,
-                )
-                retry_tcs = list(retry_validation.accepted)
-                if retry_tcs:
-                    retry_tcs = _fix_garbled_paths_in_tool_calls(retry_tcs)
-                if retry_validation.rejected:
-                    logger.warn(
-                        f"[{request_id}] Rejected continuation tool calls: "
-                        f"{[(r.raw_name, r.reason) for r in retry_validation.rejected]}"
-                    )
-
-            if retry_tcs:
-                tc_complete = [
-                    tc
-                    for tc in retry_tcs
-                    if _is_internal_task_complete_tool_call(tc) and is_task_complete_call(tc)
-                ]
-                real_tcs = _strip_internal_task_complete_tool_calls(retry_tcs)
-
-                if tc_complete and not real_tcs:
-                    tc_result = extract_task_complete_result(tc_complete[0])
-                    logger.info(f"[{request_id}] Continuation → task_complete: {tc_result[:200]}")
-                    _emit_terminal_compatibility_trace(
-                        continuation_trace,
-                        "task_complete",
-                        int((time.monotonic() - start_time) * 1000),
-                    )
-                    return {
-                        "text": first_text,
-                        "task_complete_text": tc_result,
-                        "thinking": first_thinking,
-                        "model": current_model,
-                        "fallback_attempts": len(tried_models),
-            "context_remaining_percent": last_context_remaining_percent,
-                "context_remaining_percent": last_context_remaining_percent,
-                        "stats": {"passed": 0, "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
-                    }
-
-                if real_tcs:
-                    retry_text_before = _safe_text_for_tool_source(consumed_c, retry_source)
-                    merged_text = "" if compact_tools else first_text
-                    if not compact_tools and retry_text_before and retry_text_before.strip():
-                        merged_text = first_text + "\n" + retry_text_before
-
-                    raw_names = [(tc.get("function") or {}).get("name", "?") for tc in real_tcs]
-                    logger.info(
-                        f"[{request_id}] Continuation → merged text+tool | "
-                        f"text_len={len(merged_text)} tools={raw_names}"
-                    )
-                    _emit_terminal_compatibility_trace(
-                        continuation_trace,
-                        "tool_calls",
-                        int((time.monotonic() - start_time) * 1000),
-                    )
-                    return {
-                        "tool_calls": real_tcs,
-                        "text": merged_text,
-                        "thinking": first_thinking,
-                        "model": current_model,
-                        "stats": {"passed": len(real_tcs), "normalized": 0, "filtered": 0, "invalid_arguments_filtered": 0},
-                        "fallback_attempts": len(tried_models),
-            "context_remaining_percent": last_context_remaining_percent,
-                "context_remaining_percent": last_context_remaining_percent,
-                    }
-
-            accumulated_text = retry_text
-
-        # Exhausted retries — model never called task_complete or any tool.
-        # Fall through as end_turn (safety valve).
         logger.info(
-            f"[{request_id}] Text response (after {cont_retries} continuation retries, no task_complete) | "
-            f"len={len(first_text)} | {(time.monotonic() - start_time) * 1000:.0f}ms"
+            f"[{request_id}] Final text response | len={len(clean_text)} | "
+            f"{(time.monotonic() - start_time) * 1000:.0f}ms"
         )
-        assert last_attempt_trace is not None
         _emit_terminal_compatibility_trace(
-            last_attempt_trace,
-            "upstream_error" if continuation_failed else "continuation_exhausted",
+            attempt_trace,
+            "final_text",
             int((time.monotonic() - start_time) * 1000),
         )
         return {
-            "text": first_text,
-            "thinking": first_thinking,
+            "text": clean_text,
+            "thinking": clean_thinking,
             "model": current_model,
             "fallback_attempts": len(tried_models),
             "context_remaining_percent": last_context_remaining_percent,
@@ -1446,165 +1546,6 @@ async def _call_cursor_direct(
         "fallback_attempts": len(tried_models),
         "model": None,
     }
-
-
-def _fix_garbled_paths_in_tool_calls(tool_calls: list[dict]) -> list[dict]:
-    """Fix character corruption in paths by filesystem lookup — no hardcoded char maps.
-
-    Walk each path segment top-down; when a segment doesn't exist, fuzzy-match
-    against the real directory listing to find the closest real name.
-    Works for ANY character corruption as long as the real file/dir exists on disk.
-
-    Safety rules:
-      - Only fix directory segments, not the final filename (Write may create new files)
-      - Require same length + ≥80% char match to avoid false positives
-      - For Bash commands: only fix paths that look like they reference existing trees
-      - Don't swap quote styles if the path contains single-quotes or $variables
-    """
-    _listdir_cache: dict[str, list[str]] = {}
-
-    def _cached_listdir(d: str) -> list[str]:
-        if d not in _listdir_cache:
-            try:
-                _listdir_cache[d] = os.listdir(d)
-            except OSError:
-                _listdir_cache[d] = []
-        return _listdir_cache[d]
-
-    def _fuzzy_match_segment(parent: str, broken_seg: str) -> str | None:
-        children = _cached_listdir(parent)
-        if not children:
-            return None
-        if broken_seg in children:
-            return broken_seg
-
-        best, best_score = None, 0
-        seg_len = len(broken_seg)
-        for child in children:
-            if len(child) != seg_len:
-                continue
-            score = sum(a == b for a, b in zip(child, broken_seg))
-            if score > best_score:
-                best_score = score
-                best = child
-
-        threshold = max(seg_len * 0.8, seg_len - 2)
-        if best and best_score >= threshold:
-            return best
-
-        broken_lower = broken_seg.lower()
-        for child in children:
-            if child.lower() == broken_lower:
-                return child
-        return None
-
-    def _fix_path(p: str, fix_last_segment: bool = True) -> str:
-        """Fix garbled segments in an absolute path.
-
-        fix_last_segment=False means the final component (filename) won't be
-        fuzzy-matched — used for Write/Edit where the file may not exist yet.
-        """
-        if not p or not p.startswith("/") or os.path.exists(p):
-            return p
-
-        parts = p.split("/")
-        rebuilt = ""
-        fixed = False
-        last_idx = len(parts) - 1
-        for i, seg in enumerate(parts):
-            if not seg:
-                rebuilt += "/"
-                continue
-            candidate = rebuilt + seg
-            if os.path.exists(candidate):
-                rebuilt = candidate + ("/" if i < last_idx else "")
-                continue
-            if i == last_idx and not fix_last_segment:
-                rebuilt += seg
-                continue
-            real = _fuzzy_match_segment(rebuilt if rebuilt else "/", seg)
-            if real and real != seg:
-                logger.info(f"[path-fix] segment '{seg}' → '{real}' in {rebuilt}")
-                rebuilt += real + ("/" if i < last_idx else "")
-                fixed = True
-            else:
-                rebuilt += seg + ("/" if i < last_idx else "")
-
-        if fixed and rebuilt != p:
-            return rebuilt.rstrip("/") if not p.endswith("/") else rebuilt
-        return p
-
-    def _fix_paths_in_string(s: str) -> str:
-        """Find absolute paths in Bash commands and fix garbled segments.
-
-        Only swaps double→single quotes when a path was actually fixed AND
-        the fixed path contains shell-dangerous chars (!) AND it's safe
-        (no single-quotes or $variables in the context).
-        """
-        patterns = [
-            re.compile(r'"(/[^"]+)"'),
-            re.compile(r"'(/[^']+)'"),
-            re.compile(r'(?:^|[ =])(/[^\s"\']+(?:\\ [^\s"\']+)*)'),
-            re.compile(r'(?<=\n)(/[^\s"\']+)'),
-        ]
-        result = s
-        for pat in patterns:
-            def _make_replacer(p: re.Pattern) -> callable:
-                def _replacer(m: re.Match) -> str:
-                    original = m.group(1)
-                    if not original.startswith("/"):
-                        return m.group(0)
-                    fixed_p = _fix_path(original)
-                    if fixed_p == original:
-                        return m.group(0)
-                    new_match = m.group(0).replace(original, fixed_p)
-                    if "!" in fixed_p and '"' in m.group(0):
-                        if "'" not in fixed_p and "$" not in m.group(0):
-                            new_match = new_match.replace(f'"{fixed_p}"', f"'{fixed_p}'")
-                    return new_match
-                return _replacer
-            result = pat.sub(_make_replacer(pat), result)
-        return result
-
-    WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
-
-    result = []
-    for tc in tool_calls:
-        fn = tc.get("function", {})
-        name = fn.get("name", "")
-        raw_args = fn.get("arguments", "{}")
-        try:
-            args = json.loads(raw_args)
-        except (json.JSONDecodeError, ValueError, TypeError):
-            result.append(tc)
-            continue
-        if not isinstance(args, dict):
-            result.append(tc)
-            continue
-
-        changed = False
-        is_write = name in WRITE_TOOLS
-
-        for key in ("file_path", "path", "pattern"):
-            if key in args and isinstance(args[key], str) and args[key].startswith("/"):
-                fixed = _fix_path(args[key], fix_last_segment=not is_write)
-                if fixed != args[key]:
-                    args[key] = fixed
-                    changed = True
-
-        if name == "Bash" and "command" in args and isinstance(args["command"], str):
-            fixed = _fix_paths_in_string(args["command"])
-            if fixed != args["command"]:
-                args["command"] = fixed
-                changed = True
-
-        if changed:
-            tc = {
-                **tc,
-                "function": {**fn, "arguments": json.dumps(args)},
-            }
-        result.append(tc)
-    return result
 
 
 
@@ -1627,7 +1568,11 @@ def _build_compatibility_trace(
     terminal_result: str,
     latency_ms: int,
 ) -> CompatibilityTrace:
-    """Build a trace record without exposing request, response, or error content."""
+    """Build a trace record without exposing request, response, or error content.
+
+    Compatibility ``latency_ms`` is the completed attempt duration.  It is not
+    time-to-first-token; semantic first-event timings live in stream metrics.
+    """
     text = (consumed or {}).get("text") or ""
     thinking = (consumed or {}).get("thinking") or ""
     return CompatibilityTrace(
@@ -1717,6 +1662,23 @@ async def run_pipeline(
     requested_model = req.original_model or resolved_model
     valid_tool_names = [(t.get("function") or t).get("name", "") for t in tools]
 
+    try:
+        resolve_tool_choice(req.tool_choice, valid_tool_names)
+    except ToolChoiceError as exc:
+        return {
+            "ok": False,
+            "status": 400,
+            "body": _to_api_error_body(str(exc), "invalid_request_error"),
+            "telemetry": {
+                "request_id": request_id,
+                "pipeline": "claude_code",
+                "model_requested": requested_model,
+                "model_used": None,
+                "latency_ms": _elapsed_ms(pipeline_start),
+                "stream": stream,
+            },
+        }
+
     full_system = (req.system or "") + THALAMUS_INSTRUCTION_SUPPLEMENT
     messages = [{"role": "system", "content": full_system}] + messages
 
@@ -1805,16 +1767,18 @@ def _build_streaming_result(
 ) -> dict:
     """Build the streaming result dict with an async generator."""
 
-    if original_format == "openai":
+    if original_format in ("openai", "openai_responses"):
         return _build_streaming_result_openai(
             request_id, messages, tools, valid_tool_names,
             resolved_model, max_tokens, token,
             pipeline_start, base_telemetry, requested_model, original_format,
+            req.tool_choice, req.thinking,
         )
     return _build_streaming_result_anthropic(
         request_id, messages, tools, valid_tool_names,
         resolved_model, max_tokens, token,
         pipeline_start, base_telemetry, requested_model, original_format,
+        req.tool_choice,
     )
 
 
@@ -1830,6 +1794,7 @@ def _build_streaming_result_anthropic(
     base_telemetry: dict[str, Any],
     requested_model: str | None = None,
     client_format: str | None = None,
+    tool_choice: dict[str, Any] | str | None = None,
 ) -> dict:
     message_id = f"msg_{uuid.uuid4().hex}"
     estimated_input_tokens = estimate_input_tokens(messages, tools)
@@ -1842,6 +1807,7 @@ def _build_streaming_result_anthropic(
 
         limiter = _OutputLimiter(max_tokens)
         sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        early_tool_call_id: str | None = None
 
         thinking_started = False
         thinking_ended = False
@@ -1886,37 +1852,68 @@ def _build_streaming_result_anthropic(
                 thinking_forwarder.on_delta("\n\n")
             forwarder.on_delta(delta)
 
+        def on_tool_call_start(call_id: str, name: str) -> None:
+            nonlocal early_tool_call_id
+            if early_tool_call_id is not None or not call_id or not name:
+                return
+            early_tool_call_id = call_id
+            sse = session.emit_tool_call_start(call_id, name)
+            if sse:
+                sse_queue.put_nowait(sse)
+
         async def run_cursor_call() -> dict:
             trace_context = (
                 {"requested_model": requested_model, "client_format": client_format}
                 if requested_model is not None
                 else {}
             )
-            return await _call_cursor_direct(
-                messages, resolved_model, tools, valid_tool_names, token,
-                on_stream_delta=on_text_delta,
-                on_thinking_delta=on_thinking_as_text,
-                compact_tools=False,
-                **trace_context,
-            )
+            choice_context = {"tool_choice": tool_choice} if tool_choice is not None else {}
+            callback_token = _TOOL_CALL_START_CALLBACK.set(on_tool_call_start)
+            try:
+                return await _call_cursor_direct(
+                    messages, resolved_model, tools, valid_tool_names, token,
+                    on_stream_delta=on_text_delta,
+                    on_thinking_delta=on_thinking_as_text,
+                    compact_tools=False,
+                    **choice_context,
+                    **trace_context,
+                )
+            finally:
+                _TOOL_CALL_START_CALLBACK.reset(callback_token)
 
         cursor_task = asyncio.create_task(run_cursor_call())
+        next_keepalive_at = time.monotonic() + SSE_KEEPALIVE_INTERVAL_SECONDS
 
-        while not cursor_task.done() or not sse_queue.empty():
-            try:
-                sse = sse_queue.get_nowait()
-                if sse:
-                    yield sse
-                    depth = sse_queue.qsize()
-                    if depth > 5:
-                        await asyncio.sleep(MIN_EVENT_DELAY)
-                    elif depth <= 2:
-                        await asyncio.sleep(MAX_EVENT_DELAY)
-                    else:
-                        frac = (depth - 2) / 3.0
-                        await asyncio.sleep(MAX_EVENT_DELAY - frac * (MAX_EVENT_DELAY - MIN_EVENT_DELAY))
-            except asyncio.QueueEmpty:
-                await asyncio.sleep(0.005)
+        try:
+            while not cursor_task.done() or not sse_queue.empty():
+                try:
+                    sse = sse_queue.get_nowait()
+                    if sse:
+                        yield sse
+                        next_keepalive_at = time.monotonic() + SSE_KEEPALIVE_INTERVAL_SECONDS
+                        depth = sse_queue.qsize()
+                        if depth > 5:
+                            await asyncio.sleep(MIN_EVENT_DELAY)
+                        elif depth <= 2:
+                            await asyncio.sleep(MAX_EVENT_DELAY)
+                        else:
+                            frac = (depth - 2) / 3.0
+                            await asyncio.sleep(MAX_EVENT_DELAY - frac * (MAX_EVENT_DELAY - MIN_EVENT_DELAY))
+                except asyncio.QueueEmpty:
+                    now = time.monotonic()
+                    if now >= next_keepalive_at:
+                        yield session.emit_keepalive()
+                        next_keepalive_at = now + SSE_KEEPALIVE_INTERVAL_SECONDS
+                        continue
+                    await asyncio.sleep(0.005)
+        except BaseException:
+            if not cursor_task.done():
+                cursor_task.cancel()
+                try:
+                    await cursor_task
+                except asyncio.CancelledError:
+                    pass
+            raise
 
         direct_result = cursor_task.result()
         used_model = direct_result.get("model") or resolved_model
@@ -1933,15 +1930,10 @@ def _build_streaming_result_anthropic(
             yield session.finish(stop_reason="end_turn")
             return
 
-        tool_calls = _strip_internal_task_complete_tool_calls(
-            direct_result.get("tool_calls") or []
-        )
-        task_complete_text = direct_result.get("task_complete_text", "")
+        tool_calls = direct_result.get("tool_calls") or []
 
         full_text = direct_result.get("text", "")
         final_safe = _safe_final_text_for_stream(full_text, bool(tool_calls))
-        if task_complete_text and not tool_calls:
-            final_safe = task_complete_text
         thinking_final_safe = _safe_final_text_for_stream(
             direct_result.get("thinking", ""), bool(tool_calls)
         )
@@ -1952,16 +1944,31 @@ def _build_streaming_result_anthropic(
             if sse:
                 yield sse
 
+        remaining_tool_calls = list(tool_calls)
+        if early_tool_call_id is not None:
+            early_call = next(
+                (
+                    tool_call
+                    for tool_call in remaining_tool_calls
+                    if tool_call.get("id") == early_tool_call_id
+                ),
+                None,
+            )
+            if early_call is not None:
+                function = early_call.get("function") or {}
+                yield session.finish_tool_call(function.get("arguments", "{}"))
+                remaining_tool_calls.remove(early_call)
+
         yield session.close_open_blocks()
 
-        if tool_calls:
-            yield session.emit_tool_use_blocks(tool_calls)
+        if remaining_tool_calls:
+            yield session.emit_tool_use_blocks(remaining_tool_calls)
 
         stop_reason: str
         if tool_calls:
             stop_reason = "tool_use"
-        elif task_complete_text or limiter.is_exhausted:
-            stop_reason = "end_turn" if task_complete_text else "max_tokens"
+        elif limiter.is_exhausted:
+            stop_reason = "max_tokens"
         else:
             stop_reason = "end_turn"
 
@@ -1993,39 +2000,61 @@ def _build_streaming_result_openai(
     base_telemetry: dict[str, Any],
     requested_model: str | None = None,
     client_format: str | None = None,
+    tool_choice: dict[str, Any] | str | None = None,
+    thinking: dict[str, Any] | None = None,
 ) -> dict:
-    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    is_responses = client_format == "openai_responses"
+    completion_id = (
+        f"resp_{uuid.uuid4().hex[:24]}"
+        if is_responses
+        else f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    )
     estimated_input_tokens = estimate_input_tokens(messages, tools)
 
     async def stream_handler() -> AsyncIterator[str]:
-        session = StreamingOpenAISession(
-            completion_id, resolved_model, input_tokens=estimated_input_tokens
-        )
-        yield session.emit_role_chunk()
+        if is_responses:
+            summary_mode = (thinking or {}).get("summary")
+            session = StreamingOpenAIResponsesSession(
+                completion_id,
+                resolved_model,
+                input_tokens=estimated_input_tokens,
+                emit_reasoning_summary=summary_mode not in (None, "none"),
+            )
+            yield session.start()
+        else:
+            session = StreamingOpenAISession(
+                completion_id, resolved_model, input_tokens=estimated_input_tokens
+            )
+            yield session.emit_role_chunk()
 
         limiter = _OutputLimiter(max_tokens)
-        sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        pending_text: deque[str] = deque()
         pending_reasoning: deque[str] = deque()
+        pending_tool_events: deque[str] = deque()
         pending_reasoning_chars = 0
+        last_text_delta_at: float | None = None
+        early_tool_call_id: str | None = None
         def _emit_and_enqueue(text: str) -> str | None:
             if text:
                 for i in range(0, len(text), DELTA_TARGET_SIZE):
-                    fragment = text[i:i + DELTA_TARGET_SIZE]
-                    sse = session.emit_text_delta(fragment)
-                    if sse:
-                        sse_queue.put_nowait(sse)
+                    pending_text.append(text[i:i + DELTA_TARGET_SIZE])
             return text
 
         forwarder = ToolJsonAwareTextForwarder(
             emit_text_delta=_emit_and_enqueue,
-            limiter=limiter,
+            # Apply the shared output budget when queued events are emitted so
+            # reasoning that arrived first cannot lose its budget to a later
+            # synchronous text callback.
+            limiter=_OutputLimiter(None),
         )
 
         reasoning_source_chars_consumed = 0
 
         def on_text_delta(delta: str) -> None:
+            nonlocal last_text_delta_at
             if not delta:
                 return
+            last_text_delta_at = time.monotonic()
             forwarder.on_delta(delta)
 
         def on_thinking_delta(delta: str) -> None:
@@ -2043,6 +2072,15 @@ def _build_streaming_result_openai(
                 pending_reasoning[-1] += buffered
             pending_reasoning_chars += len(buffered)
 
+        def on_tool_call_start(call_id: str, name: str) -> None:
+            nonlocal early_tool_call_id
+            if early_tool_call_id is not None or not call_id or not name:
+                return
+            early_tool_call_id = call_id
+            sse = session.emit_tool_call_start(call_id, name)
+            if sse:
+                pending_tool_events.append(sse)
+
         def next_pending_sse() -> str | None:
             nonlocal pending_reasoning_chars
             if pending_reasoning:
@@ -2051,8 +2089,12 @@ def _build_streaming_result_openai(
                 limited = limiter.emit_within_limit(reasoning)
                 if limited:
                     return session.emit_reasoning_delta(limited)
-            if not sse_queue.empty():
-                return sse_queue.get_nowait()
+            if pending_text:
+                limited = limiter.emit_within_limit(pending_text.popleft())
+                if limited:
+                    return session.emit_text_delta(limited)
+            if pending_tool_events:
+                return pending_tool_events.popleft()
             return None
 
         async def run_cursor_call() -> dict:
@@ -2061,22 +2103,39 @@ def _build_streaming_result_openai(
                 if requested_model is not None
                 else {}
             )
-            return await _call_cursor_direct(
-                messages, resolved_model, tools, valid_tool_names, token,
-                on_stream_delta=on_text_delta,
-                on_thinking_delta=on_thinking_delta,
-                compact_tools=True,
-                **trace_context,
-            )
+            choice_context = {"tool_choice": tool_choice} if tool_choice is not None else {}
+            callback_token = _TOOL_CALL_START_CALLBACK.set(on_tool_call_start)
+            try:
+                return await _call_cursor_direct(
+                    messages, resolved_model, tools, valid_tool_names, token,
+                    on_stream_delta=on_text_delta,
+                    on_thinking_delta=on_thinking_delta,
+                    compact_tools=True,
+                    **choice_context,
+                    **trace_context,
+                )
+            finally:
+                _TOOL_CALL_START_CALLBACK.reset(callback_token)
 
         cursor_task = asyncio.create_task(run_cursor_call())
+        next_keepalive_at = time.monotonic() + SSE_KEEPALIVE_INTERVAL_SECONDS
 
         try:
-            while not cursor_task.done() or not sse_queue.empty() or pending_reasoning:
+            while (
+                not cursor_task.done()
+                or pending_text
+                or pending_reasoning
+                or pending_tool_events
+            ):
                 sse = next_pending_sse()
                 if sse:
                     yield sse
-                    depth = sse_queue.qsize() + len(pending_reasoning)
+                    next_keepalive_at = time.monotonic() + SSE_KEEPALIVE_INTERVAL_SECONDS
+                    depth = (
+                        len(pending_text)
+                        + len(pending_reasoning)
+                        + len(pending_tool_events)
+                    )
                     if depth > 5:
                         await asyncio.sleep(MIN_EVENT_DELAY)
                     elif depth <= 2:
@@ -2085,6 +2144,31 @@ def _build_streaming_result_openai(
                         frac = (depth - 2) / 3.0
                         await asyncio.sleep(MAX_EVENT_DELAY - frac * (MAX_EVENT_DELAY - MIN_EVENT_DELAY))
                 else:
+                    now = time.monotonic()
+                    if (
+                        is_responses
+                        and last_text_delta_at is not None
+                        and session.has_open_message
+                        and now - last_text_delta_at
+                        >= RESPONSES_TEXT_ITEM_IDLE_FLUSH_SECONDS
+                    ):
+                        completed_item = session.flush_text_item()
+                        if completed_item:
+                            logger.debug(
+                                f"[{request_id}] Responses text item completed after "
+                                f"{RESPONSES_TEXT_ITEM_IDLE_FLUSH_SECONDS:.2f}s idle "
+                                "while upstream remained active"
+                            )
+                            yield completed_item
+                            last_text_delta_at = None
+                            next_keepalive_at = (
+                                now + SSE_KEEPALIVE_INTERVAL_SECONDS
+                            )
+                            continue
+                    if now >= next_keepalive_at:
+                        yield session.emit_keepalive()
+                        next_keepalive_at = now + SSE_KEEPALIVE_INTERVAL_SECONDS
+                        continue
                     await asyncio.sleep(0.005)
         except BaseException:
             if not cursor_task.done():
@@ -2110,9 +2194,7 @@ def _build_streaming_result_openai(
             yield session.finish(stop_reason="stop")
             return
 
-        tool_calls = _strip_internal_task_complete_tool_calls(
-            direct_result.get("tool_calls") or []
-        )
+        tool_calls = direct_result.get("tool_calls") or []
         final_thinking = direct_result.get("thinking", "")
         if len(final_thinking) > reasoning_source_chars_consumed:
             on_thinking_delta(final_thinking[reasoning_source_chars_consumed:])
@@ -2120,13 +2202,35 @@ def _build_streaming_result_openai(
         full_text = direct_result.get("text", "")
         final_safe = _safe_final_text_for_stream(full_text, bool(tool_calls))
         forwarder.flush_using_final_safe_text(final_safe)
-        while pending_reasoning or not sse_queue.empty():
+        while pending_reasoning or pending_text or pending_tool_events:
             sse = next_pending_sse()
             if sse:
                 yield sse
 
-        if tool_calls:
-            yield session.emit_tool_use_blocks(tool_calls)
+        remaining_tool_calls = list(tool_calls)
+        if early_tool_call_id is not None:
+            early_call = next(
+                (
+                    tool_call
+                    for tool_call in remaining_tool_calls
+                    if tool_call.get("id") == early_tool_call_id
+                ),
+                None,
+            )
+            if early_call is not None:
+                if is_responses:
+                    yield session.finish_tool_call(early_call)
+                else:
+                    function = early_call.get("function") or {}
+                    arguments = function.get("arguments", "{}")
+                    if isinstance(arguments, dict):
+                        arguments = json.dumps(arguments)
+                    yield session.emit_tool_call_args_delta(arguments)
+                    session.advance_tool_call()
+                remaining_tool_calls.remove(early_call)
+
+        if remaining_tool_calls:
+            yield session.emit_tool_use_blocks(remaining_tool_calls)
 
         stop_reason: str
         if tool_calls:
@@ -2172,9 +2276,11 @@ async def _build_unary_result(
         if requested_model is not None
         else {}
     )
+    choice_context = {"tool_choice": req.tool_choice} if req.tool_choice is not None else {}
     direct_result = await _call_cursor_direct(
         messages, resolved_model, tools, valid_tool_names, token,
-        compact_tools=(original_format == "openai"),
+        compact_tools=(original_format in ("openai", "openai_responses")),
+        **choice_context,
         **trace_context,
     )
 
@@ -2201,9 +2307,7 @@ async def _build_unary_result(
         direct_result.get("context_remaining_percent"),
         estimate_input_tokens(messages, tools),
     )
-    tool_calls = _strip_internal_task_complete_tool_calls(
-        direct_result.get("tool_calls") or []
-    )
+    tool_calls = direct_result.get("tool_calls") or []
     text = direct_result.get("text", "")
 
     truncated = False
@@ -2231,7 +2335,17 @@ async def _build_unary_result(
         f"tool_calls={len(tool_calls)} text_len={len(text)} latency_ms={telemetry['latency_ms']:.0f}"
     )
 
-    if original_format == "openai":
+    if original_format == "openai_responses":
+        response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        body = build_unary_openai_responses_response(
+            response_id=response_id,
+            model=used_model,
+            text=text,
+            tool_calls=tool_calls,
+            stop_reason_override=stop_reason_override,
+            input_tokens=input_tokens,
+        )
+    elif original_format == "openai":
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         body = build_unary_openai_response(
             completion_id=completion_id,

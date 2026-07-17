@@ -38,7 +38,7 @@ def test_accepts_an_exactly_advertised_name_and_object_arguments():
     }
 
 
-def test_resolves_case_and_documented_aliases_only_to_advertised_names():
+def test_rejects_case_variants_and_aliases_not_exactly_advertised():
     case_result = validate_tool_candidates(
         [_candidate("WRITE_FILE", {"path": "x"})],
         allowed_names={"write_file"},
@@ -52,10 +52,38 @@ def test_resolves_case_and_documented_aliases_only_to_advertised_names():
         allowed_names={"write_file"},
     )
 
-    assert case_result.accepted[0]["function"]["name"] == "write_file"
-    assert alias_result.accepted[0]["function"]["name"] == "Write"
-    assert reverse_alias_result.accepted == ()
-    assert reverse_alias_result.rejected[0].reason == "unknown_tool"
+    for result in (case_result, alias_result, reverse_alias_result):
+        assert result.accepted == ()
+        assert result.rejected[0].reason == "unknown_tool"
+
+
+def test_restores_a_unique_flattened_mcp_namespace_suffix():
+    result = validate_tool_candidates(
+        [_candidate("resolve-library-id", {"libraryName": "three.js"})],
+        allowed_names={"context7_resolve-library-id", "apply_patch"},
+    )
+
+    assert result.rejected == ()
+    assert result.accepted[0]["function"] == {
+        "name": "context7_resolve-library-id",
+        "arguments": '{"libraryName":"three.js"}',
+    }
+
+
+def test_rejects_an_ambiguous_or_non_suffix_mcp_leaf():
+    ambiguous = validate_tool_candidates(
+        [_candidate("query", {})],
+        allowed_names={"alpha_query", "beta_query"},
+    )
+    unrelated = validate_tool_candidates(
+        [_candidate("write_file", {})],
+        allowed_names={"apply_patch"},
+    )
+
+    assert ambiguous.accepted == ()
+    assert ambiguous.rejected[0].reason == "unknown_tool"
+    assert unrelated.accepted == ()
+    assert unrelated.rejected[0].reason == "unknown_tool"
 
 
 def test_unknown_cursor_tools_never_reach_executor():
@@ -150,26 +178,18 @@ def test_parser_cannot_coerce_null_arguments_to_an_empty_object():
     assert result.rejected[0].reason == "arguments_not_object"
 
 
-def test_task_complete_requires_explicit_internal_pipeline_permission():
+def test_task_complete_is_authorized_only_when_client_advertises_it():
     candidate = _candidate("task_complete", {"result": "done"})
 
-    external_result = validate_tool_candidates([candidate], allowed_names={"write_file"})
-    internal_result = validate_tool_candidates(
-        [candidate],
-        allowed_names={"write_file"},
-        allow_internal_task_complete=True,
-    )
-    alias_result = validate_tool_candidates(
-        [_candidate("task_tracker", {"result": "done"})],
-        allowed_names={"write_file"},
-        allow_internal_task_complete=True,
-    )
+    unadvertised = validate_tool_candidates([candidate], allowed_names={"write_file"})
+    advertised = validate_tool_candidates([candidate], allowed_names={"task_complete"})
 
-    assert external_result.accepted == ()
-    assert external_result.rejected[0].reason == "unknown_tool"
-    assert internal_result.accepted[0]["function"]["name"] == "task_complete"
-    assert alias_result.accepted == ()
-    assert alias_result.rejected[0].reason == "unknown_tool"
+    assert unadvertised.accepted == ()
+    assert unadvertised.rejected[0].reason == "unknown_tool"
+    assert advertised.accepted[0]["function"] == {
+        "name": "task_complete",
+        "arguments": '{"result":"done"}',
+    }
 
 
 def test_rejects_non_standard_json_constants():
@@ -199,27 +219,6 @@ def test_compatibility_helper_rejects_non_standard_json_constants():
     ]
 
     assert results == [(False, "arguments_invalid_json")] * 3
-
-
-def test_task_complete_requires_a_nonempty_string_result():
-    candidates = [
-        _candidate("task_complete", {}),
-        _candidate("task_complete", {"result": ""}),
-        _candidate("task_complete", {"result": 7}),
-    ]
-
-    result = validate_tool_candidates(
-        candidates,
-        allowed_names={"write_file"},
-        allow_internal_task_complete=True,
-    )
-
-    assert result.accepted == ()
-    assert [rejection.reason for rejection in result.rejected] == [
-        "invalid_task_complete_result",
-        "invalid_task_complete_result",
-        "invalid_task_complete_result",
-    ]
 
 
 def _run_all() -> int:
@@ -269,7 +268,6 @@ def test_initial_unknown_candidate_is_not_returned_to_an_executor():
         "log_llm_request": pipeline.log_llm_request,
         "log_llm_response": pipeline.log_llm_response,
         "log_llm_api_call": pipeline.log_llm_api_call,
-        "MAX_CONTINUATION_RETRIES": pipeline.MAX_CONTINUATION_RETRIES,
     }
     try:
         pipeline.build_cursor_stream_params = lambda *args: ("/chat", {}, b"")
@@ -285,7 +283,6 @@ def test_initial_unknown_candidate_is_not_returned_to_an_executor():
         pipeline.log_llm_request = lambda *args, **kwargs: ""
         pipeline.log_llm_response = lambda *args, **kwargs: ""
         pipeline.log_llm_api_call = lambda *args, **kwargs: None
-        pipeline.MAX_CONTINUATION_RETRIES = 0
         result = __import__("asyncio").run(
             pipeline._call_cursor_direct(
                 messages=[{"role": "user", "content": "write x.txt"}],
@@ -302,7 +299,7 @@ def test_initial_unknown_candidate_is_not_returned_to_an_executor():
     assert "tool_calls" not in result
 
 
-def test_continuation_unknown_candidate_is_not_returned_to_an_executor():
+def test_plain_text_with_tools_ends_after_one_upstream_call():
     from claude_code import pipeline
 
     class DummyStream:
@@ -320,7 +317,6 @@ def test_continuation_unknown_candidate_is_not_returned_to_an_executor():
         "log_llm_request": pipeline.log_llm_request,
         "log_llm_response": pipeline.log_llm_response,
         "log_llm_api_call": pipeline.log_llm_api_call,
-        "MAX_CONTINUATION_RETRIES": pipeline.MAX_CONTINUATION_RETRIES,
     }
     try:
         pipeline.build_cursor_stream_params = lambda *args: ("/chat", {}, b"")
@@ -328,18 +324,12 @@ def test_continuation_unknown_candidate_is_not_returned_to_an_executor():
 
         async def fake_consume_stream(*args, **kwargs):
             calls["count"] += 1
-            if calls["count"] == 1:
-                return _consumed("I will write x.txt.")
-            return _consumed(
-                '{"type":"tool_use","id":"toolu_2","name":"Write",'
-                '"input":{"path":"x.txt"}}'
-            )
+            return _consumed("I will write x.txt.")
 
         pipeline.consume_stream = fake_consume_stream
         pipeline.log_llm_request = lambda *args, **kwargs: ""
         pipeline.log_llm_response = lambda *args, **kwargs: ""
         pipeline.log_llm_api_call = lambda *args, **kwargs: None
-        pipeline.MAX_CONTINUATION_RETRIES = 1
         result = __import__("asyncio").run(
             pipeline._call_cursor_direct(
                 messages=[{"role": "user", "content": "write x.txt"}],
@@ -353,22 +343,12 @@ def test_continuation_unknown_candidate_is_not_returned_to_an_executor():
         for name, original in originals.items():
             setattr(pipeline, name, original)
 
-    assert calls["count"] == 2
+    assert calls["count"] == 1
     assert "tool_calls" not in result
+    assert result["text"] == "I will write x.txt."
 
 
-def _malformed_task_complete_inputs() -> tuple[dict, ...]:
-    return ({}, {"result": ""}, {"result": 7})
-
-
-def _task_complete_json(arguments: dict) -> str:
-    return json.dumps(
-        {"type": "tool_use", "id": "toolu_bad", "name": "task_complete", "input": arguments},
-        separators=(",", ":"),
-    )
-
-
-def test_initial_malformed_task_complete_never_reaches_public_tool_calls():
+def test_unadvertised_task_complete_never_reaches_public_tool_calls():
     from claude_code import pipeline
 
     class DummyStream:
@@ -385,7 +365,6 @@ def test_initial_malformed_task_complete_never_reaches_public_tool_calls():
         "log_llm_request": pipeline.log_llm_request,
         "log_llm_response": pipeline.log_llm_response,
         "log_llm_api_call": pipeline.log_llm_api_call,
-        "MAX_CONTINUATION_RETRIES": pipeline.MAX_CONTINUATION_RETRIES,
     }
     try:
         pipeline.build_cursor_stream_params = lambda *args: ("/chat", {}, b"")
@@ -393,93 +372,34 @@ def test_initial_malformed_task_complete_never_reaches_public_tool_calls():
         pipeline.log_llm_request = lambda *args, **kwargs: ""
         pipeline.log_llm_response = lambda *args, **kwargs: ""
         pipeline.log_llm_api_call = lambda *args, **kwargs: None
-        pipeline.MAX_CONTINUATION_RETRIES = 0
-        for arguments in _malformed_task_complete_inputs():
-            async def fake_consume_stream(*args, **kwargs):
-                return _consumed(_task_complete_json(arguments))
+        async def fake_consume_stream(*args, **kwargs):
+            return _consumed(
+                '{"type":"tool_use","id":"toolu_bad","name":"task_complete",'
+                '"input":{"result":"done"}}'
+            )
 
-            pipeline.consume_stream = fake_consume_stream
-            result = asyncio.run(
-                pipeline._call_cursor_direct(
-                    messages=[{"role": "user", "content": "write x.txt"}],
-                    model="standard-model",
-                    tools=[],
-                    valid_tool_names=["write_file"],
-                    auth_token="token",
-                )
+        pipeline.consume_stream = fake_consume_stream
+        result = asyncio.run(
+            pipeline._call_cursor_direct(
+                messages=[{"role": "user", "content": "write x.txt"}],
+                model="standard-model",
+                tools=[],
+                valid_tool_names=["write_file"],
+                auth_token="token",
             )
-            assert all(
-                call["function"]["name"] != "task_complete"
-                for call in result.get("tool_calls", [])
-            )
+        )
+        assert result.get("tool_calls") is None
     finally:
         for name, original in originals.items():
             setattr(pipeline, name, original)
 
 
-def test_continuation_malformed_task_complete_never_reaches_public_tool_calls():
+def test_streaming_assemblers_expose_client_declared_task_complete_normally():
     from claude_code import pipeline
-
-    class DummyStream:
-        async def __aenter__(self):
-            return object()
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    originals = {
-        "build_cursor_stream_params": pipeline.build_cursor_stream_params,
-        "open_streaming_h2_request": pipeline.open_streaming_h2_request,
-        "consume_stream": pipeline.consume_stream,
-        "log_llm_request": pipeline.log_llm_request,
-        "log_llm_response": pipeline.log_llm_response,
-        "log_llm_api_call": pipeline.log_llm_api_call,
-        "MAX_CONTINUATION_RETRIES": pipeline.MAX_CONTINUATION_RETRIES,
-    }
-    try:
-        pipeline.build_cursor_stream_params = lambda *args: ("/chat", {}, b"")
-        pipeline.open_streaming_h2_request = lambda *args: DummyStream()
-        pipeline.log_llm_request = lambda *args, **kwargs: ""
-        pipeline.log_llm_response = lambda *args, **kwargs: ""
-        pipeline.log_llm_api_call = lambda *args, **kwargs: None
-        pipeline.MAX_CONTINUATION_RETRIES = 1
-        for arguments in _malformed_task_complete_inputs():
-            calls = {"count": 0}
-
-            async def fake_consume_stream(*args, **kwargs):
-                calls["count"] += 1
-                if calls["count"] == 1:
-                    return _consumed("I will write x.txt.")
-                return _consumed(_task_complete_json(arguments))
-
-            pipeline.consume_stream = fake_consume_stream
-            result = asyncio.run(
-                pipeline._call_cursor_direct(
-                    messages=[{"role": "user", "content": "write x.txt"}],
-                    model="standard-model",
-                    tools=[],
-                    valid_tool_names=["write_file"],
-                    auth_token="token",
-                )
-            )
-            assert calls["count"] == 2
-            assert all(
-                call["function"]["name"] != "task_complete"
-                for call in result.get("tool_calls", [])
-            )
-    finally:
-        for name, original in originals.items():
-            setattr(pipeline, name, original)
-
-
-def test_assemblers_strip_task_complete_from_direct_results():
-    from claude_code import pipeline
-
-    arguments = {}
 
     async def fake_call_cursor_direct(*args, **kwargs):
         return {
-            "tool_calls": [_candidate("task_complete", arguments)],
+            "tool_calls": [_candidate("task_complete", {"result": "done"})],
             "text": "",
             "thinking": "",
             "model": "standard-model",
@@ -490,39 +410,36 @@ def test_assemblers_strip_task_complete_from_direct_results():
     original = pipeline._call_cursor_direct
     pipeline._call_cursor_direct = fake_call_cursor_direct
     try:
-        for arguments in _malformed_task_complete_inputs():
-            for builder in (
-                pipeline._build_streaming_result_anthropic,
-                pipeline._build_streaming_result_openai,
-            ):
-                result = builder(
-                    request_id="req_test",
-                    messages=[],
-                    tools=[],
-                    valid_tool_names=["write_file"],
-                    resolved_model="standard-model",
-                    max_tokens=None,
-                    token="token",
-                    pipeline_start=0,
-                    base_telemetry={},
-                )
+        for builder in (
+            pipeline._build_streaming_result_anthropic,
+            pipeline._build_streaming_result_openai,
+        ):
+            result = builder(
+                request_id="req_test",
+                messages=[],
+                tools=[],
+                valid_tool_names=["task_complete"],
+                resolved_model="standard-model",
+                max_tokens=None,
+                token="token",
+                pipeline_start=0,
+                base_telemetry={},
+            )
 
-                async def collect() -> str:
-                    return "".join([chunk async for chunk in result["stream_handler"]()])
+            async def collect() -> str:
+                return "".join([chunk async for chunk in result["stream_handler"]()])
 
-                assert "task_complete" not in asyncio.run(collect())
+            assert "task_complete" in asyncio.run(collect())
     finally:
         pipeline._call_cursor_direct = original
 
 
-def test_unary_assemblers_strip_task_complete_from_direct_results():
+def test_unary_assemblers_expose_client_declared_task_complete_normally():
     from claude_code import pipeline
-
-    arguments = {}
 
     async def fake_call_cursor_direct(*args, **kwargs):
         return {
-            "tool_calls": [_candidate("task_complete", arguments)],
+            "tool_calls": [_candidate("task_complete", {"result": "done"})],
             "text": "",
             "thinking": "",
             "model": "standard-model",
@@ -531,22 +448,23 @@ def test_unary_assemblers_strip_task_complete_from_direct_results():
         }
 
     async def assert_public_unary_responses() -> None:
-        for arguments in _malformed_task_complete_inputs():
-            for original_format in ("openai", "anthropic"):
-                result = await pipeline._build_unary_result(
-                    req=None,
+        from types import SimpleNamespace
+
+        for original_format in ("openai", "anthropic"):
+            result = await pipeline._build_unary_result(
+                    req=SimpleNamespace(tool_choice=None),
                     request_id="req_test",
                     messages=[],
                     tools=[],
-                    valid_tool_names=["write_file"],
+                    valid_tool_names=["task_complete"],
                     resolved_model="standard-model",
                     max_tokens=None,
                     token="token",
                     original_format=original_format,
                     pipeline_start=0,
                     base_telemetry={},
-                )
-                assert "task_complete" not in json.dumps(result["body"])
+            )
+            assert "task_complete" in json.dumps(result["body"])
 
     original = pipeline._call_cursor_direct
     pipeline._call_cursor_direct = fake_call_cursor_direct

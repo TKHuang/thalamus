@@ -46,33 +46,27 @@ Claude Code                                                    Cursor API
 │                                                                  │
 │  ┌─────────────┐  ┌──────────────┐  ┌─────────────────────────┐ │
 │  │  Protocol    │  │  Tool Call   │  │  Model Fallback         │ │
-│  │  Translation │→ │  Enhancement │→ │  & Auto-Continuation    │ │
-│  │              │  │  (LTLP)      │  │                         │ │
+│  │  Translation │→ │  JSON Bridge │→ │  & Interrupted Repair   │ │
+│  │              │  │              │  │                         │ │
 │  └─────────────┘  └──────────────┘  └─────────────────────────┘ │
 │                                                                  │
-│  Anthropic ↔ Protobuf  │  Lazy stubs → full schema  │  Retry    │
+│  Anthropic ↔ Protobuf  │  Deterministic schemas     │  Fallback │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Key Features
 
-### 🔮 Lazy Tool Loading Protocol (LTLP)
+### 🔮 Deterministic Tool Protocol Bridge
 
-**Problem:** Claude Code registers 40+ tools (file read, file write, bash, search, etc.) — that's ~27,000 tokens of tool definitions sent with every request. Cursor's API doesn't natively support tool definitions, so other proxies either skip tools entirely or bloat every prompt.
+**Problem:** Cursor's wire protocol does not carry the client's tool definitions, so the model needs an exact text representation without changing the original conversation.
 
-**Solution:** Thalamus compresses all tool definitions into ultra-compact one-line stubs (~1KB total). When the model tries to use a tool, Thalamus teaches it the correct parameters on-the-fly:
+**Solution:** Thalamus serializes the client-provided schemas deterministically into one system instruction. It decodes strict tool JSON back into native API tool calls and keeps the JSON out of visible text.
 
-```
-Turn 1:  Model sees stub "Write – create/overwrite files" → tries to call with guessed args
-Turn 2:  Thalamus intercepts, returns full schema as context → model learns the correct format
-Turn 3:  Model calls correctly — and remembers for all subsequent calls
-```
+### 🔄 Request Fidelity
 
-### 🔄 Auto-Continuation with `task_complete`
+**Problem:** Proxy-generated continuations and inferred tool choices change the semantics of the client's request.
 
-**Problem:** Cursor's API doesn't tell us *why* the model stopped responding (did it finish? is it thinking? did it get confused?). Other proxies just assume "done" — causing Claude Code to stop mid-task, often after just describing what it *would* do without actually doing it.
-
-**Solution:** Thalamus adds a `task_complete` signal. If the model outputs text but doesn't call any tool and doesn't explicitly say "I'm done," Thalamus nudges it: "You described the plan, now execute it." The text and subsequent tool calls get merged into one seamless response. Claude Code never sees the retry.
+**Solution:** Plain text ends the upstream turn exactly as returned, even when tools are available. Thalamus only makes one repair attempt for a recognized tool JSON object that was interrupted in transit; client-declared `tool_choice` is translated explicitly.
 
 ### 🛡️ Smart Model Fallback
 
@@ -80,9 +74,9 @@ Turn 3:  Model calls correctly — and remembers for all subsequent calls
 
 **Solution:** If the first response token doesn't arrive within a configurable timeout (default 10s), Thalamus automatically retries with the next model in a priority chain. No manual switching needed.
 
-### 📡 Dual API Compatibility
+### 📡 OpenAI and Anthropic API Compatibility
 
-Thalamus serves both Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/completions`) formats from the same backend. This means you can use it with:
+Thalamus serves Anthropic Messages (`/v1/messages`), OpenAI Chat Completions (`/v1/chat/completions`), and OpenAI Responses (`/v1/responses`) formats from the same backend. This means you can use it with:
 - **Claude Code** (Anthropic format)
 - **aider, Open WebUI, LangChain** (OpenAI format)
 - Any custom script using the `openai` or `anthropic` Python SDK
@@ -207,25 +201,24 @@ If you see a JSON response with the model's reply, everything is working.
 
 Thalamus translates between Anthropic's Messages API and Cursor's private protobuf-based gRPC API in real time. Requests arrive as standard Anthropic JSON, get encoded into Cursor's protobuf format, streamed over HTTP/2, and the response is decoded back into Anthropic SSE events.
 
-### LTLP: Learn by Doing
+### Tool Schema Translation
 
-Instead of injecting all 40+ tool definitions (27K tokens) into every prompt, Thalamus:
+For each request, Thalamus:
 
-1. **Generates stubs dynamically** from the incoming `tools[]` parameter — one line per tool, no hardcoding
-2. **Detects stub calls** when the model tries to use a tool with missing/incomplete arguments
-3. **Returns the full schema** as a `tool_result`, giving the model few-shot context
-4. **Periodically reminds** the model about available tools every N turns to prevent attention decay
+1. **Serializes the incoming schemas deterministically** without inventing proxy-only tools
+2. **Places the manifest once in the system instruction** without fake user/assistant acknowledgments
+3. **Applies `tool_choice` explicitly** instead of inferring policy from natural-language text
+4. **Quarantines protocol JSON** so it cannot leak into visible streamed text
 
 The entire mechanism is transparent — Claude Code sees standard Anthropic responses.
 
-### Continuation Retry
+### Interrupted Tool JSON Repair
 
-When the model produces text without calling any tool or `task_complete`:
+Plain text is returned immediately and does not trigger another upstream request. A repair is attempted only when the strict decoder recognizes an incomplete tool-call object caused by an interrupted stream:
 
-1. Thalamus appends a continuation prompt and re-calls the upstream API
-2. If the retry produces tool calls → merged with the original text into one response
-3. If the retry produces `task_complete` → returns `stop_reason: end_turn`
-4. Safety valve after max retries → falls through as `end_turn`
+1. Thalamus preserves the interrupted protocol state
+2. It asks for one fresh, complete tool object using the schemas already in the system instruction
+3. The replacement is decoded normally; no general continuation loop is used
 
 ## Using with Other Tools
 
@@ -243,6 +236,12 @@ client = openai.OpenAI(base_url="http://localhost:3013/v1", api_key="thalamus-pr
 response = client.chat.completions.create(
     model="claude-sonnet-4-20250514",
     messages=[{"role": "user", "content": "Hello"}]
+)
+
+# OpenAI Responses API (unary or streaming)
+response = client.responses.create(
+    model="claude-sonnet-4-20250514",
+    input="Hello"
 )
 
 # Python anthropic SDK
@@ -282,6 +281,7 @@ All settings go in `.env` (copy from `.env.example`). Most users only need `CURS
 | GET | `/health` | Health check (includes token status) |
 | POST | `/v1/messages` | Anthropic Messages API (primary) |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions API |
+| POST | `/v1/responses` | OpenAI Responses API (unary, SSE, and function calls) |
 | GET | `/v1/models` | List available models |
 | GET | `/cursor/login` | Initiate PKCE browser login |
 | POST | `/token/update` | Update Cursor token |
@@ -291,9 +291,9 @@ All settings go in `.env` (copy from `.env.example`). Most users only need `CURS
 
 | | Thalamus | Cursor-To-OpenAI | CCProxy | LiteLLM |
 |---|---|---|---|---|
-| Lazy Tool Loading (LTLP) | ✅ | ❌ | ❌ | ❌ |
-| Auto-continuation | ✅ | ❌ | ❌ | ❌ |
-| Stub reminders | ✅ | ❌ | ❌ | ❌ |
+| Deterministic client tool schemas | ✅ | ❌ | ❌ | ❌ |
+| Explicit `tool_choice` translation | ✅ | ❌ | ❌ | Partial |
+| Interrupted tool JSON repair | ✅ | ❌ | ❌ | ❌ |
 | Model fallback chain | ✅ | ❌ | Partial | ✅ |
 | Anthropic API output | ✅ | ❌ | ❌ | ✅ |
 | OpenAI API output | ✅ | ✅ | ✅ | ✅ |
@@ -394,9 +394,9 @@ thalamus/
 │   ├── protobuf_frame_parser.py  # Response protobuf decoding
 │   └── token_manager.py       # Token persistence & rotation
 ├── claude_code/
-│   ├── pipeline.py            # Main request pipeline (LTLP + continuation + fallback)
-│   ├── tool_lazy_loader.py    # Stub generation, schema store, LTLP core
-│   ├── tool_prompt_builder.py # Prompt injection & periodic reminders
+│   ├── pipeline.py            # Main request pipeline (strict decode + repair + fallback)
+│   ├── tool_choice.py         # Explicit client tool-choice policy translation
+│   ├── tool_prompt_builder.py # Deterministic system-level tool manifest
 │   ├── tool_parser.py         # Tool call extraction from text
 │   ├── sse_assembler.py       # Anthropic SSE event assembly
 │   ├── openai_sse_assembler.py  # OpenAI SSE event assembly
@@ -476,7 +476,7 @@ Your Cursor token may have expired. Tokens typically last ~60 days. Re-login:
 <details>
 <summary><b>Can I use this with tools other than Claude Code?</b></summary>
 
-Yes. Thalamus serves both Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/completions`) formats. You can use it with:
+Yes. Thalamus serves Anthropic (`/v1/messages`), OpenAI Chat Completions (`/v1/chat/completions`), and OpenAI Responses (`/v1/responses`) formats. You can use it with:
 - **aider** — `export ANTHROPIC_BASE_URL=http://localhost:3013`
 - **Open WebUI** — set the API base URL in settings
 - **Python scripts** — use the `openai` or `anthropic` SDK with custom base URL
@@ -486,12 +486,12 @@ Yes. Thalamus serves both Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/compl
 <details>
 <summary><b>How is this different from cursor2api / Cursor-To-OpenAI?</b></summary>
 
-Those projects do basic protocol conversion. Thalamus adds three mechanisms that make Claude Code actually work reliably:
-1. **LTLP** — compresses 40+ tool definitions from 27K tokens to 1KB stubs (without this, tool calling often fails)
-2. **Auto-continuation** — prevents the model from stopping mid-task when it outputs text without tools
+Those projects do basic protocol conversion. Thalamus adds three mechanisms that make Claude Code work reliably without changing request semantics:
+1. **Deterministic tool bridge** — serializes the exact client schemas once and decodes strict tool JSON
+2. **Request fidelity** — preserves plain text, applies `tool_choice` explicitly, and repairs only recognized interrupted tool JSON
 3. **Model fallback** — automatically retries with different models when one is slow/unavailable
 
-Without these, Claude Code frequently breaks: tools don't get called, tasks stop halfway, or the model times out.
+Without these, tool calls can fail, protocol JSON can leak into visible text, or the model can time out.
 </details>
 
 <details>
@@ -525,18 +525,18 @@ Contributions are welcome. Please open an issue first to discuss what you'd like
 
 ### 为什么不能直接用其他代理？
 
-其他项目（cursor2api、Cursor-To-OpenAI 等）只做简单的协议转换。但 Claude Code 有 40+ 个工具定义（文件读写、bash 执行、搜索等），Cursor API 不原生支持这些，所以直接转发会导致：
+其他项目（cursor2api、Cursor-To-OpenAI 等）只做简单的协议转换。但 Cursor 的 wire protocol 不携带客户端工具定义，所以直接转发会导致：
 
 - 工具调不通（模型不知道参数格式）
-- 任务做到一半就停了（模型输出文字后被误判为"完成"）
+- 工具 JSON 泄漏到用户可见文字
 - 模型超时无响应
 
 Thalamus 解决了这三个核心问题：
 
 | 机制 | 解决什么 |
 |---|---|
-| **🔮 懒加载 Tool 协议 (LTLP)** | 40+ 工具定义（27K tokens）压缩为 1KB 的精简描述，按需加载完整定义，模型通过上下文自动学会正确参数 |
-| **🔄 自动续接** | 模型输出纯文字但没执行操作时，自动提醒它继续执行，把文字和操作合并为一个完整响应 |
+| **🔮 确定性 Tool 协议** | 将客户端原始 schema 一次性序列化到 system instruction，并严格解码工具 JSON |
+| **🔄 请求语义保真** | 纯文字直接结束回合，显式执行 `tool_choice`，仅修复已识别的中断工具 JSON |
 | **🛡️ 智能模型回退** | 模型响应慢或不可用时，自动切换到下一个可用模型，不需要手动干预 |
 
 ### 使用教程

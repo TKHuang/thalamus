@@ -12,6 +12,7 @@ from claude_code.composer_tool_protocol import ComposerMarkerV1Adapter  # noqa: 
 from claude_code.tool_prompt_builder import inject_tool_prompt_into_messages  # noqa: E402
 from claude_code.tool_protocols import ProtocolDecodeState, ProtocolFragment  # noqa: E402
 from claude_code.tool_validation import validate_tool_candidates  # noqa: E402
+from core.protobuf_tool_call_parser import NativeToolCall  # noqa: E402
 
 
 TOOLS = [{"name": "write_file", "input_schema": {"type": "object"}}]
@@ -65,12 +66,36 @@ def _consumed(
         "text": text,
         "thinking": thinking or marker_thinking,
         "composer_tool_calls": composer_calls or [],
+        "native_tool_calls": [],
         "interrupted_tool_state": interrupted_tool_state,
         "has_fatal_error": False,
         "errors": [],
         "had_content": bool(text or thinking or marker_thinking),
         "metrics": {"chunk_count": 1, "first_chunk_latency_ms": 0},
     }
+
+
+def _native_consumed(
+    *,
+    name: str = "write_file",
+    arguments: dict | None = None,
+    call_id: str = "call_native",
+    text: str = "",
+    thinking: str = "",
+) -> dict:
+    value = _consumed(text=text, thinking=thinking)
+    args = arguments or {"path": "x.txt"}
+    value["native_tool_calls"] = [
+        NativeToolCall(
+            enum=49,
+            call_id=call_id,
+            name=name,
+            raw_arguments=json.dumps(args),
+            arguments=args,
+        )
+    ]
+    value["had_content"] = True
+    return value
 
 
 def _request_text(messages: list[dict]) -> str:
@@ -109,12 +134,10 @@ def test_composer_adapter_separates_unicode_reasoning_answer_and_tools_across_bo
             ("write_file", {"path": "/tmp/émoji-工具.txt"})
         ], boundary
 
-    continuation = ComposerMarkerV1Adapter().render_continuation(TOOLS, "create a file", "I will do it")
     repair = ComposerMarkerV1Adapter().render_repair(TOOLS, "partial marker call")
-    assert "<|tool_calls_begin|>" in continuation
     assert "<|tool_calls_begin|>" in repair
-    assert '"type":"tool_use"' not in continuation
     assert '"type":"tool_use"' not in repair
+    assert "Available client tools" not in repair
 
 
 def test_composer_adapter_sends_invalid_json_arguments_to_strict_validation():
@@ -226,9 +249,11 @@ def test_fallback_rebuilds_the_initial_manifest_for_the_effective_model(monkeypa
             return "composer-2.5" if tried == ["standard-model"] else None
 
     request_messages: list[list[dict]] = []
+    request_tools: list[list[dict]] = []
+    request_models: list[str] = []
     calls = {"count": 0}
 
-    def fake_build_cursor_stream_params(auth_token, messages, model):
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
         request_messages.append(list(messages))
         return "/chat", {}, b""
 
@@ -241,9 +266,20 @@ def test_fallback_rebuilds_the_initial_manifest_for_the_effective_model(monkeypa
             composer_calls=[{"name": "write_file", "arguments": {"path": "x.txt"}}]
         )
 
+    async def fake_agent(messages, model, tools, auth_token, **kwargs):
+        del auth_token, kwargs
+        calls["count"] += 1
+        request_messages.append(list(messages))
+        request_tools.append(list(tools))
+        request_models.append(model)
+        if calls["count"] == 1:
+            raise RuntimeError("retry elsewhere")
+        return _native_consumed()
+
     monkeypatch.setattr(pipeline, "build_cursor_stream_params", fake_build_cursor_stream_params)
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: _DummyStream())
     monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
     monkeypatch.setattr(pipeline, "load_fallback_config", lambda: FallbackConfig())
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
@@ -260,16 +296,158 @@ def test_fallback_rebuilds_the_initial_manifest_for_the_effective_model(monkeypa
     )
 
     assert result["tool_calls"][0]["function"]["name"] == "write_file"
-    assert "Available client tools are the following JSON schemas:" in _request_text(request_messages[0])
-    assert "<|tool_calls_begin|>" in _request_text(request_messages[1])
-    assert '"type":"tool_use"' not in _request_text(request_messages[1])
+    assert request_models == ["standard-model", "composer-2.5"]
+    assert request_tools == [TOOLS, TOOLS]
+    assert all("tool_calls_begin" not in _request_text(value) for value in request_messages)
 
 
-def test_composer_continuation_and_repair_use_marker_grammar(monkeypatch):
+def test_agent_partial_text_blocks_matching_model_fallback(monkeypatch):
+    class FallbackConfig:
+        max_attempts = 2
+
+        @staticmethod
+        def should_fallback(error_text):
+            return error_text == "retry elsewhere"
+
+        @staticmethod
+        def select_next_model(requested, tried):
+            return "fallback-model" if tried == ["primary-model"] else None
+
+    calls: list[str] = []
+    streamed: list[str] = []
+
+    async def fake_agent(messages, model, tools, auth_token, **kwargs):
+        del messages, tools, auth_token
+        calls.append(model)
+        kwargs["on_text_delta"]("already visible")
+        return {
+            **_consumed(text="already visible"),
+            "errors": ["retry elsewhere"],
+            "has_fatal_error": True,
+            "replay_safe": False,
+        }
+
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
+    monkeypatch.setattr(pipeline, "load_fallback_config", lambda: FallbackConfig())
+    monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
+    monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
+    monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
+
+    result = asyncio.run(
+        pipeline._call_cursor_direct(
+            messages=[{"role": "user", "content": "create x.txt"}],
+            model="primary-model",
+            tools=TOOLS,
+            valid_tool_names=["write_file"],
+            auth_token="token",
+            on_stream_delta=streamed.append,
+        )
+    )
+
+    assert calls == ["primary-model"]
+    assert streamed == ["already visible"]
+    assert result["error"] == "retry elsewhere"
+    assert result["fallback_attempts"] == 0
+
+
+def test_agent_tool_start_blocks_matching_model_fallback(monkeypatch):
+    class FallbackConfig:
+        max_attempts = 2
+
+        @staticmethod
+        def should_fallback(error_text):
+            return error_text == "retry elsewhere"
+
+        @staticmethod
+        def select_next_model(requested, tried):
+            return "fallback-model" if tried == ["primary-model"] else None
+
+    calls: list[str] = []
+
+    async def fake_agent(messages, model, tools, auth_token, **kwargs):
+        del messages, tools, auth_token
+        calls.append(model)
+        kwargs["on_tool_call_start"]("call_started", "write_file")
+        return {
+            **_consumed(),
+            "errors": ["retry elsewhere"],
+            "has_fatal_error": True,
+            "replay_safe": False,
+        }
+
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
+    monkeypatch.setattr(pipeline, "load_fallback_config", lambda: FallbackConfig())
+    monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
+    monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
+    monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
+
+    result = asyncio.run(
+        pipeline._call_cursor_direct(
+            messages=[{"role": "user", "content": "create x.txt"}],
+            model="primary-model",
+            tools=TOOLS,
+            valid_tool_names=["write_file"],
+            auth_token="token",
+        )
+    )
+
+    assert calls == ["primary-model"]
+    assert result["error"] == "retry elsewhere"
+    assert result["fallback_attempts"] == 0
+
+
+def test_agent_zero_content_error_remains_model_fallback_safe(monkeypatch):
+    class FallbackConfig:
+        max_attempts = 2
+
+        @staticmethod
+        def should_fallback(error_text):
+            return error_text == "retry elsewhere"
+
+        @staticmethod
+        def select_next_model(requested, tried):
+            return "fallback-model" if tried == ["primary-model"] else None
+
+    calls: list[str] = []
+
+    async def fake_agent(messages, model, tools, auth_token, **kwargs):
+        del messages, tools, auth_token, kwargs
+        calls.append(model)
+        if model == "primary-model":
+            return {
+                **_consumed(),
+                "errors": ["retry elsewhere"],
+                "has_fatal_error": True,
+                "replay_safe": True,
+            }
+        return _native_consumed()
+
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
+    monkeypatch.setattr(pipeline, "load_fallback_config", lambda: FallbackConfig())
+    monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
+    monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
+    monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
+
+    result = asyncio.run(
+        pipeline._call_cursor_direct(
+            messages=[{"role": "user", "content": "create x.txt"}],
+            model="primary-model",
+            tools=TOOLS,
+            valid_tool_names=["write_file"],
+            auth_token="token",
+        )
+    )
+
+    assert calls == ["primary-model", "fallback-model"]
+    assert result["tool_calls"][0]["function"]["name"] == "write_file"
+    assert result["fallback_attempts"] == 1
+
+
+def test_composer_tools_use_agent_transport_without_marker_repair(monkeypatch):
     request_messages: list[list[dict]] = []
     calls = {"count": 0}
 
-    def fake_build_cursor_stream_params(auth_token, messages, model):
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
         request_messages.append(list(messages))
         return "/chat", {}, b""
 
@@ -283,11 +461,15 @@ def test_composer_continuation_and_repair_use_marker_grammar(monkeypatch):
                     thinking="reasoning</think><|tool_calls_beg",
                 ),
             )
-        if calls["count"] == 2:
-            return _consumed(text="I will write it.")
         return _consumed(
             composer_calls=[{"name": "write_file", "arguments": {"path": "x.txt"}}]
         )
+
+    async def fake_agent(messages, model, tools, auth_token, **kwargs):
+        del model, tools, auth_token, kwargs
+        calls["count"] += 1
+        request_messages.append(list(messages))
+        return _native_consumed()
 
     created_adapters = []
     original_create_protocol_adapter = pipeline.create_protocol_adapter
@@ -300,6 +482,7 @@ def test_composer_continuation_and_repair_use_marker_grammar(monkeypatch):
     monkeypatch.setattr(pipeline, "build_cursor_stream_params", fake_build_cursor_stream_params)
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: _DummyStream())
     monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
     monkeypatch.setattr(pipeline, "create_protocol_adapter", recording_create_protocol_adapter)
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
@@ -316,16 +499,11 @@ def test_composer_continuation_and_repair_use_marker_grammar(monkeypatch):
     )
 
     assert result["tool_calls"][0]["function"]["name"] == "write_file"
-    assert len(request_messages) == 3
-    assert len(created_adapters) >= 3
+    assert calls["count"] == 1
+    assert len(request_messages) == 1
+    assert len(created_adapters) == 1
     assert len({id(adapter) for adapter in created_adapters}) == len(created_adapters)
-    repair_text = _request_text(request_messages[1])
-    continuation_text = _request_text(request_messages[2])
-    assert repair_text.count("Repair the interrupted tool call.") == 1
-    assert "<|tool_calls_begin|>" in repair_text
-    assert "<|tool_calls_begin|>" in continuation_text
-    assert '"type":"tool_use"' not in repair_text
-    assert '"type":"tool_use"' not in continuation_text
+    assert "Repair the interrupted tool call." not in _request_text(request_messages[0])
 
 
 def test_fallback_rebuilds_standard_and_composer_manifests_for_the_next_model(monkeypatch):
@@ -347,9 +525,10 @@ def test_fallback_rebuilds_standard_and_composer_manifests_for_the_next_model(mo
                 return fallback_model if tried == [initial_model] else None
 
         request_messages: list[list[dict]] = []
+        request_models: list[str] = []
         calls = {"count": 0}
 
-        def fake_build_cursor_stream_params(auth_token, messages, model):
+        def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
             request_messages.append(list(messages))
             return "/chat", {}, b""
 
@@ -366,9 +545,19 @@ def test_fallback_rebuilds_standard_and_composer_manifests_for_the_next_model(mo
                 )
             )
 
+        async def fake_agent(messages, model, tools, auth_token, **kwargs):
+            del tools, auth_token, kwargs
+            calls["count"] += 1
+            request_messages.append(list(messages))
+            request_models.append(model)
+            if calls["count"] == 1:
+                raise RuntimeError("retry elsewhere")
+            return _native_consumed()
+
         monkeypatch.setattr(pipeline, "build_cursor_stream_params", fake_build_cursor_stream_params)
         monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: _DummyStream())
         monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+        monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
         monkeypatch.setattr(pipeline, "load_fallback_config", lambda: FallbackConfig())
         monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
         monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
@@ -385,15 +574,8 @@ def test_fallback_rebuilds_standard_and_composer_manifests_for_the_next_model(mo
         )
 
         assert result["tool_calls"][0]["function"]["name"] == "write_file"
-        initial_rendered = _request_text(request_messages[0])
-        fallback_rendered = _request_text(request_messages[1])
-        if initial_composer:
-            assert "<|tool_calls_begin|>" in initial_rendered
-            assert '"type":"tool_use"' not in initial_rendered
-        else:
-            assert "Available client tools are the following JSON schemas:" in initial_rendered
-        assert "Available client tools are the following JSON schemas:" in fallback_rendered
-        assert "<|tool_calls_begin|>" not in fallback_rendered
+        assert request_models == [initial_model, fallback_model]
+        assert all("tool_calls_begin" not in _request_text(value) for value in request_messages)
 
 
 def _result_with_text(text: str) -> dict:
@@ -498,9 +680,13 @@ def test_pipeline_streams_whitespace_native_json_only_as_structured_tool_calls(m
                 on_text_delta(fragment)
         return _result_with_text(tool_json)
 
+    async def fake_agent(*args, **kwargs):
+        return _native_consumed(arguments={"path": "x.txt", "content": "x"})
+
     monkeypatch.setattr(pipeline, "build_cursor_stream_params", lambda *args: ("/chat", {}, b""))
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: _DummyStream())
     monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
@@ -546,7 +732,7 @@ def _composer_partial_consumed(thinking: str) -> dict:
     }
 
 
-def test_callback_fed_composer_partial_markers_repair_once_without_leaking(monkeypatch):
+def test_composer_native_agent_calls_do_not_leak_marker_syntax(monkeypatch):
     complete_marker = (
         "</think><|tool_calls_begin|><|tool_call_begin|>write_file<|tool_sep|>"
         "path\nrepaired.txt<|tool_call_end|><|tool_calls_end|>"
@@ -578,9 +764,27 @@ def test_callback_fed_composer_partial_markers_repair_once_without_leaking(monke
                     on_thinking_delta(complete_marker)
                 return _composer_partial_consumed(complete_marker)
 
+            async def fake_agent(
+                messages,
+                model,
+                tools,
+                auth_token,
+                on_text_delta=None,
+                on_thinking_delta=None,
+            ):
+                del messages, model, tools, auth_token, on_text_delta
+                calls["count"] += 1
+                if on_thinking_delta:
+                    on_thinking_delta("reasoning")
+                return _native_consumed(
+                    arguments={"path": "repaired.txt"},
+                    thinking="reasoning",
+                )
+
             monkeypatch.setattr(pipeline, "build_cursor_stream_params", lambda *args: ("/chat", {}, b""))
             monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: _DummyStream())
             monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+            monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
             monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
             monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
             monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
@@ -598,7 +802,7 @@ def test_callback_fed_composer_partial_markers_repair_once_without_leaking(monke
             )
 
             emitted = "".join([*public_text, *public_thinking])
-            assert calls["count"] == 2, (marker, resets_stream)
+            assert calls["count"] == 1, (marker, resets_stream)
             assert result["tool_calls"][0]["function"]["name"] == "write_file"
             assert "repaired.txt" in result["tool_calls"][0]["function"]["arguments"]
             assert "partial" not in result["tool_calls"][0]["function"]["arguments"]

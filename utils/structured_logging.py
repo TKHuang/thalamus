@@ -54,6 +54,7 @@ LOGGER_NAME_TO_LAYER_AND_TOPIC: dict[str, dict[str, str]] = {
     "bearer-token":       {"layer": "auth",     "topic": "bearer-extractor"},
     "pkce-login":         {"layer": "auth",     "topic": "pkce-login"},
     "h2-client":          {"layer": "core",     "topic": "http2-client"},
+    "agent-client":       {"layer": "core",     "topic": "agent-client"},
     "protobuf-parser":    {"layer": "core",     "topic": "protobuf-parser"},
     "protobuf-builder":   {"layer": "core",     "topic": "protobuf-builder"},
     "tool-parser":        {"layer": "pipeline", "topic": "tool-parser"},

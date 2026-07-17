@@ -423,7 +423,7 @@ def _assert_legacy_splitter_matches_existing(chunks: list[str]) -> None:
     assert flushed.candidates == ()
 
 
-def test_manifest_serializes_original_schema_without_flattening_or_mutation():
+def test_manifest_preserves_original_schema_without_mutation():
     tools = [
         {
             "type": "function",
@@ -444,19 +444,15 @@ def test_manifest_serializes_original_schema_without_flattening_or_mutation():
     assert tools[0]["function"]["parameters"]["properties"]["file_path"]["minLength"] == 1
 
 
-def test_renderers_keep_native_tool_grammar_for_continuation_and_repair():
+def test_repair_renderer_keeps_native_tool_grammar():
     adapter = StandardJsonV1Adapter()
     tools = [{"name": "read_file", "input_schema": {"type": "object"}}]
 
-    continuation = adapter.render_continuation(tools, "Inspect x.py", "I need to read it.")
     repair = adapter.render_repair(tools, '{"type":"tool_use"')
 
-    assert _CALL.split('"input"')[0] not in continuation
-    assert '"type":"tool_use"' in continuation
-    assert "Inspect x.py" in continuation
-    assert "I need to read it." in continuation
     assert '"type":"tool_use"' in repair
     assert "Do not continue truncated JSON." in repair
+    assert "Available client tools" not in repair
 
 
 def test_flush_keeps_unrecognized_unclosed_object_as_visible_text():

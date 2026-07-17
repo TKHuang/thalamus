@@ -101,25 +101,29 @@ async def create_message(request: Request):
 
             async def wrapped_stream():
                 nonlocal sse_chunks
+                upstream_stream = stream_handler()
                 try:
-                    async for chunk in stream_handler():
+                    async for chunk in upstream_stream:
                         sse_chunks.append(chunk)
                         yield chunk
                 finally:
                     try:
-                        raw_sse = "".join(sse_chunks)
-                        events = parse_sse_to_events(raw_sse)
-                        res_path = log_thalamus_response(
-                            request_id, ENDPOINT_MESSAGES, 200, events,
-                            latency_ms=int((time.time() - start_time) * 1000),
-                        )
-                        log_thalamus_api_call(
-                            request_id, ENDPOINT_MESSAGES, "POST", 200,
-                            int((time.time() - start_time) * 1000),
-                            req_path, res_path,
-                        )
-                    except Exception:
-                        pass
+                        await upstream_stream.aclose()
+                    finally:
+                        try:
+                            raw_sse = "".join(sse_chunks)
+                            events = parse_sse_to_events(raw_sse)
+                            res_path = log_thalamus_response(
+                                request_id, ENDPOINT_MESSAGES, 200, events,
+                                latency_ms=int((time.time() - start_time) * 1000),
+                            )
+                            log_thalamus_api_call(
+                                request_id, ENDPOINT_MESSAGES, "POST", 200,
+                                int((time.time() - start_time) * 1000),
+                                req_path, res_path,
+                            )
+                        except Exception:
+                            pass
 
             return StreamingResponse(
                 wrapped_stream(),

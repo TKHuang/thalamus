@@ -287,6 +287,82 @@ def test_context_suffix_routes_same_model_through_max_mode(monkeypatch) -> None:
     assert unknown_legacy.request.largeContext == 1
 
 
+def test_client_tools_use_request_scoped_mcp_wire_schema() -> None:
+    request = _decode_chat_request(
+        build_gzip_framed_protobuf_chat_request_body(
+            [{"role": "user", "content": "use the exact client tool"}],
+            "gpt-5.6-sol",
+            agent_mode=True,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "arbitrary_client_tool",
+                        "description": "An arbitrary client-owned tool.",
+                        "parameters": {
+                            "required": ["value"],
+                            "properties": {"value": {"type": "string"}},
+                            "type": "object",
+                        },
+                    },
+                }
+            ],
+        )
+    )
+
+    # Live Cursor A/B: neither enum works alone; the server recognizes the
+    # request-scoped MCP inventory only when both capabilities are advertised.
+    assert list(request.request.supportedTools) == [19, 49]
+    assert request.request.HasField("hasMcpDescriptors")
+    assert request.request.hasMcpDescriptors is True
+    assert len(request.request.mcpTools) == 1
+    tool = request.request.mcpTools[0]
+    assert tool.name == "arbitrary_client_tool"
+    assert tool.description == "An arbitrary client-owned tool."
+    # Client-owned functions are direct request capabilities, not members of a
+    # real MCP server. A fabricated server name makes Cursor treat the tool as
+    # unavailable because no matching server descriptor exists.
+    assert tool.serverName == ""
+    assert tool.parameters == (
+        '{"properties":{"value":{"type":"string"}},'
+        '"required":["value"],"type":"object"}'
+    )
+
+
+def test_developer_messages_reach_cursor_as_instructions_not_assistant_text() -> None:
+    request = _decode_chat_request(
+        build_gzip_framed_protobuf_chat_request_body(
+            [
+                {"role": "developer", "content": "Working directory: /workspace/project"},
+                {"role": "user", "content": "Create output.html"},
+            ],
+            "gpt-5.6-sol",
+            agent_mode=True,
+        )
+    )
+
+    assert request.request.instruction.instruction == (
+        "Working directory: /workspace/project"
+    )
+    assert [message.role for message in request.request.messages] == [1, 1]
+    assert request.request.messages[0].content.startswith("[system]\n")
+    assert request.request.messages[1].content == "Create output.html"
+
+
+def test_no_client_tools_claims_no_cursor_capability() -> None:
+    request = _decode_chat_request(
+        build_gzip_framed_protobuf_chat_request_body(
+            [{"role": "user", "content": "plain text"}],
+            "gpt-5.6-sol",
+            agent_mode=True,
+        )
+    )
+
+    assert list(request.request.supportedTools) == []
+    assert list(request.request.mcpTools) == []
+    assert not request.request.HasField("hasMcpDescriptors")
+
+
 def test_numeric_context_field_wins_when_cursor_populates_it(monkeypatch) -> None:
     """The stable numeric field takes precedence over human-readable tooltip text."""
     response = pb.AvailableModelsResponse()

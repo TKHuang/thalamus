@@ -1,0 +1,1173 @@
+syntax = "proto3";
+
+package agent.v1;
+
+import "google/protobuf/struct.proto";
+
+enum AgentMode {
+  AGENT_MODE_UNSPECIFIED = 0;
+  AGENT_MODE_AGENT = 1;
+  AGENT_MODE_ASK = 2;
+  AGENT_MODE_PLAN = 3;
+  AGENT_MODE_DEBUG = 4;
+  AGENT_MODE_TRIAGE = 5;
+  AGENT_MODE_PROJECT = 6;
+  AGENT_MODE_MULTITASK = 7;
+}
+
+message McpToolDefinition {
+  string name = 1;
+  string description = 2;
+  google.protobuf.Value input_schema = 3;
+  string provider_identifier = 4;
+  string tool_name = 5;
+}
+
+message McpToolDescriptor {
+  string tool_name = 1;
+  optional string definition_path = 2;
+  optional string description = 3;
+  optional google.protobuf.Value input_schema = 4;
+}
+
+message McpTools {
+  repeated McpToolDefinition mcp_tools = 1;
+}
+
+message ConversationHistoryTextContent {
+  string text = 1;
+}
+
+message ConversationHistoryImageContent {
+  string data = 1;
+  optional string mime_type = 2;
+}
+
+message ConversationHistoryUserContent {
+  oneof content {
+    ConversationHistoryTextContent text = 1;
+    ConversationHistoryImageContent image = 2;
+  }
+}
+
+message ConversationHistoryUserMessage {
+  repeated ConversationHistoryUserContent content = 1;
+}
+
+message ConversationHistoryReasoningContent {
+  string text = 1;
+  optional string signature = 2;
+}
+
+message ConversationHistoryToolCall {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  string args_json = 3;
+}
+
+message ConversationHistoryAssistantContent {
+  oneof content {
+    ConversationHistoryTextContent text = 1;
+    ConversationHistoryReasoningContent reasoning = 2;
+    ConversationHistoryToolCall tool_call = 4;
+  }
+}
+
+message ConversationHistoryAssistantMessage {
+  repeated ConversationHistoryAssistantContent content = 1;
+}
+
+message ConversationHistoryToolResultContent {
+  oneof content {
+    ConversationHistoryTextContent text = 1;
+    ConversationHistoryImageContent image = 2;
+  }
+}
+
+message ConversationHistoryToolMessage {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  repeated ConversationHistoryToolResultContent content = 3;
+  optional bool is_error = 4;
+}
+
+message ConversationHistoryMessage {
+  oneof message {
+    ConversationHistoryUserMessage user = 1;
+    ConversationHistoryAssistantMessage assistant = 2;
+    ConversationHistoryToolMessage tool = 3;
+  }
+}
+
+message ConversationHistory {
+  repeated ConversationHistoryMessage messages = 1;
+  optional bool replace_user_info = 2;
+}
+
+message UserMessage {
+  string text = 1;
+  string message_id = 2;
+  AgentMode mode = 4;
+  optional string rich_text = 8;
+}
+
+message RequestContext {
+  repeated McpToolDefinition tools = 7;
+  optional bool git_repo_info_complete = 33;
+  optional bool mcp_info_complete = 36;
+  optional bool rules_info_complete = 39;
+  optional bool env_info_complete = 40;
+  optional bool repository_info_complete = 41;
+  optional bool custom_subagents_info_complete = 42;
+  optional bool agent_skills_info_complete = 43;
+  optional bool mcp_file_system_info_complete = 44;
+  optional bool git_status_info_complete = 45;
+}
+
+message UserMessageAction {
+  UserMessage user_message = 1;
+  RequestContext request_context = 2;
+  optional bool send_to_interaction_listener = 3;
+  repeated UserMessage prepend_user_messages = 4;
+  ConversationHistory conversation_history = 7;
+}
+
+message ConversationAction {
+  oneof action {
+    UserMessageAction user_message_action = 1;
+  }
+}
+
+message ConversationStateStructure {
+  optional AgentMode mode = 10;
+  optional string agent_type = 22;
+}
+
+message ModelDetails {
+  string model_id = 1;
+  string display_model_id = 3;
+  string display_name = 4;
+  string display_name_short = 5;
+}
+
+message RequestedModel {
+  string model_id = 1;
+  bool max_mode = 2;
+  bool built_in_model = 7;
+}
+
+message AgentRunRequest {
+  ConversationStateStructure conversation_state = 1;
+  ConversationAction action = 2;
+  ModelDetails model_details = 3;
+  McpTools mcp_tools = 4;
+  optional string conversation_id = 5;
+  optional string custom_system_prompt = 8;
+  optional RequestedModel requested_model = 9;
+  optional bool exclude_workspace_context = 12;
+  optional string harness = 13;
+  optional string conversation_group_id = 16;
+}
+
+message AgentClientMessage {
+  oneof message {
+    AgentRunRequest run_request = 1;
+    ExecClientMessage exec_client_message = 2;
+    KvClientMessage kv_client_message = 3;
+    ExecClientControlMessage exec_client_control_message = 5;
+    InteractionResponse interaction_response = 6;
+    ClientHeartbeat client_heartbeat = 7;
+  }
+}
+
+message ClientHeartbeat {}
+
+message SmartModeApproval {
+  string request_id = 1;
+  string reason = 2;
+}
+
+message McpArgs {
+  string name = 1;
+  map<string, google.protobuf.Value> args = 2;
+  string tool_call_id = 3;
+  string provider_identifier = 4;
+  string tool_name = 5;
+  optional SmartModeApproval smart_mode_approval = 6;
+  bool smart_mode_approval_only = 7;
+  bool skip_approval = 8;
+  string server_identifier = 9;
+}
+
+message McpToolCall {
+  McpArgs args = 1;
+  McpToolResult result = 2;
+  optional string description = 3;
+}
+
+// Cursor-native client execution lanes.  Thalamus excludes these from the
+// advertised ToolCall inventory because the caller's harness owns filesystem,
+// shell, and diagnostics access.  They remain in the decoder so an Agent that
+// ignores the exclusion can receive the official typed policy rejection rather
+// than a transport-level ExecClientThrow.
+message ShellArgs {
+  string command = 1;
+  string working_directory = 2;
+  int32 timeout = 3;
+  string tool_call_id = 4;
+}
+
+message ShellRejected {
+  string command = 1;
+  string working_directory = 2;
+  string reason = 3;
+  bool is_readonly = 4;
+}
+
+message ShellResult {
+  oneof result {
+    ShellRejected rejected = 4;
+  }
+}
+
+message ShellStream {
+  oneof event {
+    ShellRejected rejected = 5;
+  }
+}
+
+message WriteArgs {
+  string path = 1;
+  string file_text = 2;
+  string tool_call_id = 3;
+  bool return_file_content_after_write = 4;
+  bytes file_bytes = 5;
+  optional string encoding_hint = 6;
+}
+
+message WriteRejected {
+  string path = 1;
+  string reason = 2;
+}
+
+message WriteResult {
+  oneof result {
+    WriteRejected rejected = 6;
+  }
+}
+
+message DeleteArgs {
+  string path = 1;
+  string tool_call_id = 2;
+}
+
+message DeleteRejected {
+  string path = 1;
+  string reason = 2;
+}
+
+message DeleteResult {
+  oneof result {
+    DeleteRejected rejected = 6;
+  }
+}
+
+message GrepArgs {
+  string pattern = 1;
+  optional string path = 2;
+  string tool_call_id = 14;
+}
+
+message GrepError {
+  string error = 1;
+}
+
+message GrepResult {
+  oneof result {
+    GrepError error = 2;
+  }
+}
+
+message ReadArgs {
+  string path = 1;
+  string tool_call_id = 2;
+  optional int32 offset = 4;
+  optional uint32 limit = 5;
+  optional string encoding_hint = 6;
+}
+
+message ReadRejected {
+  string path = 1;
+  string reason = 2;
+}
+
+message ReadResult {
+  oneof result {
+    ReadRejected rejected = 3;
+  }
+}
+
+message LsArgs {
+  string path = 1;
+  repeated string ignore = 2;
+  string tool_call_id = 3;
+}
+
+message LsRejected {
+  string path = 1;
+  string reason = 2;
+}
+
+message LsResult {
+  oneof result {
+    LsRejected rejected = 3;
+  }
+}
+
+message DiagnosticsArgs {
+  string path = 1;
+  string tool_call_id = 2;
+}
+
+message DiagnosticsRejected {
+  string path = 1;
+  string reason = 2;
+}
+
+message DiagnosticsResult {
+  oneof result {
+    DiagnosticsRejected rejected = 3;
+  }
+}
+
+message SpanContext {
+  string trace_id = 1;
+  string span_id = 2;
+  optional uint32 trace_flags = 3;
+  optional string trace_state = 4;
+}
+
+// Cursor may request the workspace/environment context through a dedicated
+// execution lane even when the run already includes request-scoped MCP tools.
+// A proxy has no authority to inspect the caller's workspace, so it returns
+// the same MCP inventory and marks every optional local context source as
+// complete rather than triggering Cursor-native filesystem execution.
+message RequestContextArgs {
+  optional string notes_session_id = 2;
+  optional string workspace_id = 3;
+  optional string read_only_pinned_tree_sha = 4;
+  optional string read_only_plugin_cache_root = 5;
+}
+
+message RequestContextSuccess {
+  RequestContext request_context = 1;
+}
+
+message RequestContextError {
+  string error = 1;
+}
+
+message RequestContextRejected {
+  string reason = 1;
+}
+
+message RequestContextResult {
+  oneof result {
+    RequestContextSuccess success = 1;
+    RequestContextError error = 2;
+    RequestContextRejected rejected = 3;
+  }
+}
+
+// AgentService can deliver an MCP invocation through the execution lane
+// before (or without) the corresponding interaction update.  A client that
+// only consumes InteractionUpdate will keep heartbeating forever while the
+// server waits for this request to be executed.
+message ExecServerMessage {
+  uint32 id = 1;
+  oneof message {
+    ShellArgs shell_args = 2;
+    WriteArgs write_args = 3;
+    DeleteArgs delete_args = 4;
+    GrepArgs grep_args = 5;
+    ReadArgs read_args = 7;
+    LsArgs ls_args = 8;
+    DiagnosticsArgs diagnostics_args = 9;
+    RequestContextArgs request_context_args = 10;
+    McpArgs mcp_args = 11;
+    ShellArgs shell_stream_args = 14;
+    ReadArgs redacted_read_args = 29;
+    McpStateExecArgs mcp_state_exec_args = 36;
+    ShellAllowlistPrecheckArgs shell_allowlist_precheck_args = 41;
+    McpAllowlistPrecheckArgs mcp_allowlist_precheck_args = 42;
+    WebFetchAllowlistPrecheckArgs web_fetch_allowlist_precheck_args = 43;
+  }
+  string exec_id = 15;
+  SpanContext span_context = 19;
+}
+
+message McpAllowlistPrecheckArgs {
+  string provider_identifier = 1;
+  string tool_name = 2;
+  optional string tool_call_id = 3;
+}
+
+message McpAllowlistPrecheckResult {
+  bool allowlisted = 1;
+}
+
+message ShellAllowlistPrecheckArgs {
+  string command = 1;
+  string working_directory = 2;
+  optional string tool_call_id = 5;
+}
+
+message ShellAllowlistPrecheckResult {
+  bool allowlisted = 1;
+}
+
+message WebFetchAllowlistPrecheckArgs {
+  string url = 1;
+  optional string tool_call_id = 2;
+}
+
+message WebFetchAllowlistPrecheckResult {
+  bool allowlisted = 1;
+}
+
+message McpStateExecArgs {
+  repeated string server_identifiers = 1;
+}
+
+message McpStateServer {
+  string server_name = 1;
+  string server_identifier = 2;
+  optional string plugin = 3;
+  optional string marketplace = 4;
+  repeated McpToolDescriptor tools = 5;
+  optional string status = 7;
+}
+
+message McpStateSuccess {
+  repeated McpStateServer servers = 1;
+}
+
+message McpStateError {
+  string error = 1;
+}
+
+message McpStateRejected {
+  string reason = 1;
+}
+
+message McpStateExecResult {
+  oneof result {
+    McpStateSuccess success = 1;
+    McpStateError error = 2;
+    McpStateRejected rejected = 3;
+  }
+}
+
+message McpTextContent {
+  string text = 1;
+}
+
+message McpImageContent {
+  bytes data = 1;
+  string mime_type = 2;
+}
+
+message McpToolResultContentItem {
+  oneof content {
+    McpTextContent text = 1;
+    McpImageContent image = 2;
+  }
+}
+
+message McpSuccess {
+  repeated McpToolResultContentItem content = 1;
+  bool is_error = 2;
+  google.protobuf.Struct structured_content = 3;
+}
+
+message McpError {
+  string error = 1;
+}
+
+message McpRejected {
+  string reason = 1;
+  bool is_readonly = 2;
+}
+
+message McpPermissionDenied {
+  string error = 1;
+  bool is_readonly = 2;
+}
+
+message McpToolError {
+  string error = 1;
+  string read_tool_def_reminder = 2;
+}
+
+message McpToolResult {
+  oneof result {
+    McpSuccess success = 1;
+    McpToolError error = 2;
+    McpRejected rejected = 3;
+    McpPermissionDenied permission_denied = 4;
+  }
+}
+
+message McpToolNotFound {
+  string name = 1;
+  repeated string available_tools = 2;
+}
+
+message McpServerNotFound {
+  string name = 1;
+  repeated string available_servers = 2;
+}
+
+message McpApproved {}
+
+message McpResult {
+  oneof result {
+    McpSuccess success = 1;
+    McpError error = 2;
+    McpRejected rejected = 3;
+    McpPermissionDenied permission_denied = 4;
+    McpToolNotFound tool_not_found = 5;
+    McpServerNotFound server_not_found = 6;
+    McpApproved approved = 7;
+  }
+}
+
+message ExecClientMessage {
+  uint32 id = 1;
+  oneof message {
+    ShellResult shell_result = 2;
+    WriteResult write_result = 3;
+    DeleteResult delete_result = 4;
+    GrepResult grep_result = 5;
+    ReadResult read_result = 7;
+    LsResult ls_result = 8;
+    DiagnosticsResult diagnostics_result = 9;
+    RequestContextResult request_context_result = 10;
+    McpResult mcp_result = 11;
+    ShellStream shell_stream = 14;
+    ReadResult redacted_read_result = 29;
+    McpStateExecResult mcp_state_exec_result = 36;
+    ShellAllowlistPrecheckResult shell_allowlist_precheck_result = 41;
+    McpAllowlistPrecheckResult mcp_allowlist_precheck_result = 42;
+    WebFetchAllowlistPrecheckResult web_fetch_allowlist_precheck_result = 43;
+  }
+  string exec_id = 15;
+}
+
+message ExecClientStreamClose {
+  uint32 id = 1;
+}
+
+message ExecClientThrow {
+  uint32 id = 1;
+  string error = 2;
+  optional string stack_trace = 3;
+  optional string error_code = 4;
+}
+
+message ExecClientHeartbeat {
+  uint32 id = 1;
+}
+
+message ExecClientControlMessage {
+  oneof message {
+    ExecClientStreamClose stream_close = 1;
+    ExecClientThrow throw = 2;
+    ExecClientHeartbeat heartbeat = 3;
+  }
+}
+
+message ExecServerAbort {
+  uint32 id = 1;
+}
+
+message ExecServerControlMessage {
+  oneof message {
+    ExecServerAbort abort = 1;
+  }
+}
+
+message GetBlobArgs {
+  bytes blob_id = 1;
+}
+
+message GetBlobResult {
+  optional bytes blob_data = 1;
+}
+
+message SetBlobArgs {
+  bytes blob_id = 1;
+  bytes blob_data = 2;
+}
+
+message Error {
+  string message = 1;
+}
+
+message SetBlobResult {
+  optional Error error = 1;
+}
+
+message KvServerMessage {
+  uint32 id = 1;
+  oneof message {
+    GetBlobArgs get_blob_args = 2;
+    SetBlobArgs set_blob_args = 3;
+  }
+}
+
+message KvClientMessage {
+  uint32 id = 1;
+  oneof message {
+    GetBlobResult get_blob_result = 2;
+    SetBlobResult set_blob_result = 3;
+  }
+}
+
+message ConversationCheckpointUpdate {}
+
+message WebSearchArgs {
+  string search_term = 1;
+  string tool_call_id = 2;
+}
+
+message WebSearchRequestQuery {
+  WebSearchArgs args = 1;
+}
+
+message WebSearchRequestResponse {
+  message Approved {}
+  message Rejected {
+    string reason = 1;
+  }
+  oneof result {
+    Approved approved = 1;
+    Rejected rejected = 2;
+  }
+}
+
+message WebFetchArgs {
+  string url = 1;
+  string tool_call_id = 2;
+}
+
+message WebFetchRequestQuery {
+  WebFetchArgs args = 1;
+  bool skip_approval = 2;
+}
+
+message WebFetchRequestResponse {
+  message Approved {}
+  message Rejected {
+    string reason = 1;
+  }
+  oneof result {
+    Approved approved = 1;
+    Rejected rejected = 2;
+  }
+}
+
+message GenerateImageArgs {
+  string description = 1;
+  optional string file_path = 2;
+  repeated string reference_image_paths = 5;
+  optional string aspect_ratio = 6;
+}
+
+message GenerateImageRequestQuery {
+  GenerateImageArgs args = 1;
+  string tool_call_id = 2;
+}
+
+message GenerateImageRequestResponse {
+  message Approved {
+    string description = 1;
+  }
+  message Rejected {
+    string reason = 1;
+  }
+  oneof result {
+    Approved approved = 1;
+    Rejected rejected = 2;
+  }
+}
+
+message AskQuestionArgs {
+  message Question {
+    message Option {
+      string id = 1;
+      string label = 2;
+    }
+
+    string id = 1;
+    string prompt = 2;
+    repeated Option options = 3;
+    bool allow_multiple = 4;
+  }
+
+  string title = 1;
+  repeated Question questions = 2;
+  bool run_async = 5;
+  string async_original_tool_call_id = 6;
+}
+
+message AskQuestionAsync {}
+
+message AskQuestionSuccess {
+  message Answer {
+    string question_id = 1;
+    repeated string selected_option_ids = 2;
+    string freeform_text = 3;
+  }
+
+  repeated Answer answers = 1;
+}
+
+message AskQuestionError {
+  string error_message = 1;
+}
+
+message AskQuestionRejected {
+  string reason = 1;
+}
+
+message AskQuestionResult {
+  oneof result {
+    AskQuestionSuccess success = 1;
+    AskQuestionError error = 2;
+    AskQuestionRejected rejected = 3;
+    AskQuestionAsync async = 4;
+  }
+}
+
+message AskQuestionInteractionQuery {
+  AskQuestionArgs args = 1;
+  string tool_call_id = 2;
+}
+
+message AskQuestionInteractionResponse {
+  AskQuestionResult result = 1;
+}
+
+message SwitchModeArgs {
+  string target_mode_id = 1;
+  optional string explanation = 2;
+  string tool_call_id = 3;
+}
+
+message SwitchModeRequestQuery {
+  SwitchModeArgs args = 1;
+}
+
+message SwitchModeRequestResponse {
+  message Approved {}
+  message Rejected {
+    string reason = 1;
+  }
+  oneof result {
+    Approved approved = 1;
+    Rejected rejected = 2;
+  }
+}
+
+enum TodoStatus {
+  TODO_STATUS_UNSPECIFIED = 0;
+  TODO_STATUS_PENDING = 1;
+  TODO_STATUS_IN_PROGRESS = 2;
+  TODO_STATUS_COMPLETED = 3;
+  TODO_STATUS_CANCELLED = 4;
+}
+
+message TodoItem {
+  string id = 1;
+  string content = 2;
+  TodoStatus status = 3;
+  int64 created_at = 4;
+  int64 updated_at = 5;
+  repeated string dependencies = 6;
+}
+
+message Phase {
+  string name = 1;
+  repeated TodoItem todos = 2;
+}
+
+message CreatePlanArgs {
+  string plan = 1;
+  repeated TodoItem todos = 2;
+  string overview = 3;
+  string name = 4;
+  bool is_project = 5;
+  repeated Phase phases = 6;
+}
+
+message CreatePlanSuccess {}
+
+message CreatePlanError {
+  string error = 1;
+}
+
+message CreatePlanResult {
+  oneof result {
+    CreatePlanSuccess success = 1;
+    CreatePlanError error = 2;
+  }
+  string plan_uri = 3;
+}
+
+message CreatePlanRequestQuery {
+  CreatePlanArgs args = 1;
+  string tool_call_id = 2;
+}
+
+message CreatePlanRequestResponse {
+  CreatePlanResult result = 1;
+}
+
+message SetupVmEnvironmentArgs {
+  string install_command = 2;
+  string start_command = 3;
+  string dockerfile_contents = 4;
+}
+
+message SetupVmEnvironmentSuccess {}
+
+message SetupVmEnvironmentResult {
+  oneof result {
+    SetupVmEnvironmentSuccess success = 1;
+  }
+}
+
+enum PullRequestStatus {
+  PULL_REQUEST_STATUS_UNSPECIFIED = 0;
+  PULL_REQUEST_STATUS_OPEN = 1;
+  PULL_REQUEST_STATUS_CLOSED = 2;
+}
+
+message CreatePrAction {
+  string title = 1;
+  string body = 2;
+  optional string base_branch = 3;
+  optional bool draft = 4;
+  string branch_name = 5;
+  repeated string add_labels = 6;
+  optional string repo_url = 7;
+  optional bool skip_branch_prefix_check = 8;
+}
+
+message UpdatePrAction {
+  optional string pr_url = 1;
+  optional string title = 2;
+  optional string body = 3;
+  optional string base_branch = 4;
+  optional string branch_name = 5;
+  repeated string add_labels = 6;
+  repeated string remove_labels = 7;
+  optional string repo_url = 8;
+}
+
+message PostCommentAction {
+  optional string pr_url = 1;
+  optional string branch_name = 2;
+  string body = 3;
+  optional string repo_url = 4;
+  optional int64 in_reply_to = 5;
+  optional string path = 6;
+  optional int32 line = 7;
+  optional int32 start_line = 8;
+  optional string side = 9;
+}
+
+message ResolveCommentAction {
+  optional string pr_url = 1;
+  optional string branch_name = 2;
+  int64 comment_id = 3;
+  optional string repo_url = 4;
+}
+
+message GetCiStatusAction {
+  optional string pr_url = 1;
+  optional string branch_name = 2;
+  optional string repo_url = 3;
+}
+
+message SetPrStatusAction {
+  optional string pr_url = 1;
+  optional string branch_name = 2;
+  optional string repo_url = 3;
+  PullRequestStatus status = 4;
+}
+
+message PrManagementArgs {
+  string tool_call_id = 1;
+  oneof action {
+    CreatePrAction create_pr = 2;
+    UpdatePrAction update_pr = 3;
+    PostCommentAction post_comment = 4;
+    ResolveCommentAction resolve_comment = 5;
+    GetCiStatusAction get_ci_status = 6;
+    SetPrStatusAction set_pr_status = 7;
+  }
+}
+
+message PrManagementSuccess {
+  string pr_url = 1;
+  int32 pr_number = 2;
+  string message = 3;
+}
+
+message PrManagementError {
+  string error = 1;
+}
+
+message PrManagementRejected {
+  string reason = 1;
+}
+
+message PrManagementRegistered {
+  string message = 1;
+  string title = 2;
+  string body = 3;
+  optional string base_branch = 4;
+  optional bool draft = 5;
+  string branch_name = 6;
+}
+
+message PrManagementNeedsConfirmation {
+  string message = 1;
+  string discovered_pr_url = 2;
+  int32 discovered_pr_number = 3;
+  string discovered_pr_title = 4;
+  string branch_name = 5;
+}
+
+message PrManagementResult {
+  oneof result {
+    PrManagementSuccess success = 1;
+    PrManagementError error = 2;
+    PrManagementRejected rejected = 3;
+    PrManagementRegistered registered = 4;
+    PrManagementNeedsConfirmation needs_confirmation = 5;
+  }
+}
+
+message PrManagementRequestQuery {
+  PrManagementArgs args = 1;
+}
+
+message McpAuthArgs {
+  string server_identifier = 1;
+  string tool_call_id = 2;
+}
+
+message McpAuthRequestQuery {
+  McpAuthArgs args = 1;
+}
+
+message McpAuthRequestResponse {
+  message Approved {}
+  message Rejected {
+    string reason = 1;
+  }
+  oneof result {
+    Approved approved = 1;
+    Rejected rejected = 2;
+  }
+}
+
+enum ReplaceEnvMode {
+  REPLACE_ENV_MODE_UNSPECIFIED = 0;
+  REPLACE_ENV_MODE_CUSTOM = 1;
+  REPLACE_ENV_MODE_CLEAN_SLATE = 2;
+  REPLACE_ENV_MODE_DEFAULT = 3;
+}
+
+message RepoCheckoutRefOverride {
+  string repo_url = 1;
+  string ref = 2;
+}
+
+message ReplaceEnvConfig {
+  string install_script = 1;
+  string dockerfile_contents = 2;
+}
+
+message ReplaceEnvArgs {
+  ReplaceEnvConfig config = 1;
+  ReplaceEnvMode mode = 2;
+  repeated RepoCheckoutRefOverride checkout_ref_overrides = 3;
+}
+
+message ReplaceEnvSuccess {
+  string setup_logs = 1;
+}
+
+message ReplaceEnvFailure {
+  string error_message = 1;
+  string setup_logs = 2;
+}
+
+message ReplaceEnvResult {
+  oneof result {
+    ReplaceEnvSuccess success = 1;
+    ReplaceEnvFailure failure = 2;
+  }
+}
+
+message ConnectScmGithubRepository {
+  string owner = 1;
+  string repo = 2;
+}
+
+message ConnectScmGithub {
+  ConnectScmGithubRepository repository = 1;
+  optional string ghe_application = 2;
+}
+
+message ConnectScmArgs {
+  string tool_call_id = 1;
+  oneof target {
+    ConnectScmGithub github = 2;
+  }
+}
+
+message ConnectScmRequestQuery {
+  ConnectScmArgs args = 1;
+}
+
+message ConnectScmRequestResponse {
+  message Approved {}
+  message Rejected {
+    string reason = 1;
+  }
+  message Failed {
+    string error = 1;
+  }
+  oneof result {
+    Approved approved = 1;
+    Rejected rejected = 2;
+    Failed failed = 3;
+  }
+}
+
+message InteractionQuery {
+  uint32 id = 1;
+  oneof query {
+    WebSearchRequestQuery web_search_request_query = 2;
+    AskQuestionInteractionQuery ask_question_interaction_query = 3;
+    SwitchModeRequestQuery switch_mode_request_query = 4;
+    CreatePlanRequestQuery create_plan_request_query = 7;
+    SetupVmEnvironmentArgs setup_vm_environment_args = 8;
+    WebFetchRequestQuery web_fetch_request_query = 9;
+    PrManagementRequestQuery pr_management_request_query = 10;
+    McpAuthRequestQuery mcp_auth_request_query = 11;
+    GenerateImageRequestQuery generate_image_request_query = 12;
+    ReplaceEnvArgs replace_env_args = 13;
+    ConnectScmRequestQuery connect_scm_request_query = 14;
+  }
+}
+
+message InteractionResponse {
+  uint32 id = 1;
+  oneof result {
+    WebSearchRequestResponse web_search_request_response = 2;
+    AskQuestionInteractionResponse ask_question_interaction_response = 3;
+    SwitchModeRequestResponse switch_mode_request_response = 4;
+    CreatePlanRequestResponse create_plan_request_response = 7;
+    SetupVmEnvironmentResult setup_vm_environment_result = 8;
+    WebFetchRequestResponse web_fetch_request_response = 9;
+    PrManagementResult pr_management_result = 10;
+    McpAuthRequestResponse mcp_auth_request_response = 11;
+    GenerateImageRequestResponse generate_image_request_response = 12;
+    ReplaceEnvResult replace_env_result = 13;
+    ConnectScmRequestResponse connect_scm_request_response = 14;
+  }
+}
+
+message ToolCall {
+  oneof tool {
+    McpToolCall mcp_tool_call = 15;
+  }
+  optional string tool_call_id = 57;
+}
+
+message TextDeltaUpdate {
+  string text = 1;
+}
+
+message ThinkingDeltaUpdate {
+  string text = 1;
+}
+
+message ToolCallStartedUpdate {
+  string call_id = 1;
+  ToolCall tool_call = 2;
+  string model_call_id = 3;
+}
+
+message ToolCallCompletedUpdate {
+  string call_id = 1;
+  ToolCall tool_call = 2;
+  string model_call_id = 3;
+}
+
+message PartialToolCallUpdate {
+  string call_id = 1;
+  ToolCall tool_call = 2;
+  string args_text_delta = 3;
+  string model_call_id = 4;
+}
+
+message ToolCallDelta {}
+
+message ToolCallDeltaUpdate {
+  string call_id = 1;
+  ToolCallDelta tool_call_delta = 2;
+  string model_call_id = 3;
+}
+
+message ThinkingCompletedUpdate {}
+message HeartbeatUpdate {}
+
+message TurnEndedUpdate {
+  optional int64 input_tokens = 1;
+  optional int64 output_tokens = 2;
+  optional int64 cache_read_tokens = 3;
+  optional int64 cache_write_tokens = 4;
+  optional int64 reasoning_tokens = 5;
+}
+
+message InteractionUpdate {
+  oneof message {
+    TextDeltaUpdate text_delta = 1;
+    ToolCallStartedUpdate tool_call_started = 2;
+    ToolCallCompletedUpdate tool_call_completed = 3;
+    ThinkingDeltaUpdate thinking_delta = 4;
+    ThinkingCompletedUpdate thinking_completed = 5;
+    PartialToolCallUpdate partial_tool_call = 7;
+    HeartbeatUpdate heartbeat = 13;
+    TurnEndedUpdate turn_ended = 14;
+    ToolCallDeltaUpdate tool_call_delta = 15;
+  }
+}
+
+message AgentServerMessage {
+  oneof message {
+    InteractionUpdate interaction_update = 1;
+    ExecServerMessage exec_server_message = 2;
+    ConversationCheckpointUpdate conversation_checkpoint_update = 3;
+    KvServerMessage kv_server_message = 4;
+    ExecServerControlMessage exec_server_control_message = 5;
+    InteractionQuery interaction_query = 7;
+  }
+}

@@ -12,6 +12,7 @@ Port of: cursor_protobuf_request_body_builder_and_checksum_generator.js
 import base64
 import gzip
 import hashlib
+import json
 import re
 import struct
 import time
@@ -24,6 +25,8 @@ from proto import cursor_api_pb2 as pb
 from utils.structured_logging import ThalamusStructuredLogger
 
 logger = ThalamusStructuredLogger.get_logger("protobuf-builder", "DEBUG")
+
+CLIENT_MCP_TOOL_ENUMS = (19, 49)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +77,7 @@ def build_gzip_framed_protobuf_chat_request_body(
     messages: list[dict],
     model_name: str,
     agent_mode: bool = False,
+    tools: list[dict] | None = None,
 ) -> bytes:
     """Build a framed (magic + length + payload) protobuf body for Cursor API.
 
@@ -93,8 +97,9 @@ def build_gzip_framed_protobuf_chat_request_body(
     ]
     total_content_length = sum(len(m.get("content", "")) for m in parsed)
 
+    instruction_roles = {"system", "developer"}
     instruction_text = "\n".join(
-        m["content"] for m in parsed if m.get("role") == "system"
+        m["content"] for m in parsed if m.get("role") in instruction_roles
     )
 
     formatted: list[dict] = []
@@ -108,7 +113,7 @@ def build_gzip_framed_protobuf_chat_request_body(
         })
 
     for m in parsed:
-        if m.get("role") == "system":
+        if m.get("role") in instruction_roles:
             continue
         role_int = 1 if m["role"] == "user" else 2
         msg_id = str(uuid4())
@@ -174,9 +179,35 @@ def build_gzip_framed_protobuf_chat_request_body(
 
     r.unknown27 = 1 if agent_mode else 0
 
-    # supportedTools left empty — tool calling is handled entirely via
-    # prompt injection + text-based JSON parsing, not Cursor's native
-    # protobuf tool call mechanism.
+    # Transport the request-scoped client inventory through Cursor's generic MCP
+    # bridge.  Never infer a Cursor built-in from a client tool name or prompt.
+    for tool in tools or []:
+        if not isinstance(tool, dict) or tool.get("type") not in (None, "function"):
+            continue
+        function = tool.get("function") or tool
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        description = function.get("description")
+        parameters = function.get("parameters", function.get("input_schema"))
+        if not isinstance(parameters, dict):
+            parameters = {}
+
+        proto_tool = r.mcpTools.add()
+        proto_tool.name = name
+        proto_tool.description = description if isinstance(description, str) else ""
+        proto_tool.parameters = json.dumps(
+            parameters,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    if r.mcpTools:
+        r.supportedTools.extend(CLIENT_MCP_TOOL_ENUMS)
+        r.hasMcpDescriptors = True
 
     for mid in message_ids:
         proto_mid = r.messageIds.add()

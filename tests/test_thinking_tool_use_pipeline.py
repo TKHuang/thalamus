@@ -12,6 +12,7 @@ from proto import cursor_api_pb2 as pb  # noqa: E402
 from claude_code import pipeline  # noqa: E402
 from claude_code.normalizers import normalize_anthropic, normalize_openai  # noqa: E402
 from claude_code.tool_protocols import ToolProtocol, create_protocol_adapter  # noqa: E402
+from core.protobuf_tool_call_parser import NativeToolCall  # noqa: E402
 
 
 DELTA_TARGET_SIZE = pipeline.DELTA_TARGET_SIZE
@@ -222,7 +223,7 @@ def test_openai_stream_hides_text_tool_use_json(monkeypatch):
     assert "Creating the file now." in text, sse
 
 
-def test_compact_continuation_suppresses_preliminary_text_when_tool_call_succeeds(monkeypatch):
+def test_compact_plain_text_with_filename_streams_once_without_coercion(monkeypatch):
     class DummyStream:
         async def __aenter__(self):
             return object()
@@ -233,7 +234,7 @@ def test_compact_continuation_suppresses_preliminary_text_when_tool_call_succeed
     calls = {"count": 0}
     streamed: list[str] = []
 
-    def fake_build_cursor_stream_params(auth_token, messages, model):
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
         return "/chat", {}, b""
 
     def fake_open_streaming_h2_request(path, headers, body):
@@ -300,12 +301,15 @@ def test_compact_continuation_suppresses_preliminary_text_when_tool_call_succeed
         )
     )
 
-    assert calls["count"] == 2
-    assert streamed == []
-    assert result["tool_calls"][0]["function"]["name"] == "write_file"
+    assert calls["count"] == 1
+    streamed_text = "".join(streamed)
+    assert "I will create the file." in streamed_text
+    assert '{"type":"tool_use"' not in streamed_text
+    assert result["text"] == "I will create the file."
+    assert result.get("tool_calls") is None
 
 
-def test_compact_continuation_prompt_coerces_promised_write_file(monkeypatch):
+def test_filename_never_creates_a_write_file_instruction(monkeypatch):
     class DummyStream:
         async def __aenter__(self):
             return object()
@@ -315,8 +319,9 @@ def test_compact_continuation_prompt_coerces_promised_write_file(monkeypatch):
 
     calls = {"count": 0}
     request_messages: list[list[dict]] = []
+    request_tools: list[list[dict]] = []
 
-    def fake_build_cursor_stream_params(auth_token, messages, model):
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
         request_messages.append(list(messages))
         return "/chat", {}, b""
 
@@ -336,11 +341,6 @@ def test_compact_continuation_prompt_coerces_promised_write_file(monkeypatch):
                 "metrics": {"chunk_count": 1, "first_chunk_latency_ms": 0},
             }
 
-        continuation_prompt = request_messages[-1][-1]["content"]
-        assert '"name":"write_file"' in continuation_prompt
-        assert '"path":"qingming-3d-grok45.html"' in continuation_prompt
-        assert "<ToolName>" not in continuation_prompt
-
         return {
             "text": (
                 '{"type":"tool_use","id":"toolu_write","name":"write_file",'
@@ -354,9 +354,27 @@ def test_compact_continuation_prompt_coerces_promised_write_file(monkeypatch):
             "metrics": {"chunk_count": 1, "first_chunk_latency_ms": 0},
         }
 
+    async def fake_agent(messages, model, tools, auth_token, **kwargs):
+        del model, auth_token, kwargs
+        calls["count"] += 1
+        request_messages.append(list(messages))
+        request_tools.append(list(tools))
+        return {
+            "text": "改用指定的 tool_use JSON 格式直接建立檔案。",
+            "thinking": "",
+            "composer_tool_calls": [],
+            "native_tool_calls": [],
+            "interrupted_tool_state": "",
+            "has_fatal_error": False,
+            "errors": [],
+            "had_content": True,
+            "metrics": {"chunk_count": 1, "first_chunk_latency_ms": 0},
+        }
+
     monkeypatch.setattr(pipeline, "build_cursor_stream_params", fake_build_cursor_stream_params)
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", fake_open_streaming_h2_request)
     monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
@@ -370,120 +388,31 @@ def test_compact_continuation_prompt_coerces_promised_write_file(monkeypatch):
                 }
             ],
             model="grok-4.5",
-            tools=[],
+            tools=[
+                {
+                    "name": "write_file",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                }
+            ],
             valid_tool_names=["skill_view", "write_file", "terminal"],
             auth_token="tok",
             compact_tools=True,
         )
     )
 
-    assert calls["count"] == 2
-    assert result["tool_calls"][0]["function"]["name"] == "write_file"
-    assert "qingming-3d-grok45.html" in result["tool_calls"][0]["function"]["arguments"]
+    assert calls["count"] == 1
+    assert result["text"] == "改用指定的 tool_use JSON 格式直接建立檔案。"
+    assert result.get("tool_calls") is None
+    assert request_messages[0][-1]["content"].endswith("不准看其他檔案")
+    assert request_tools[0][0]["name"] == "write_file"
+    assert "qingming-3d-grok45.html" not in json.dumps(request_tools[0])
 
 
-def test_current_openai_tool_result_accepts_any_nonempty_final_text():
-    messages = [
-        {"role": "user", "content": "make q.html"},
-        {
-            "role": "assistant",
-            "content": "Creating it now.",
-            "tool_calls": [
-                {
-                    "id": "toolu_01",
-                    "type": "function",
-                    "function": {"name": "write_file", "arguments": "{}"},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "toolu_01", "content": '{"bytes_written":123}'},
-    ]
-
-    assert pipeline._should_accept_final_text_without_continuation(
-        messages,
-        "完成，檔案在這裡：/tmp/q.html",
-    )
-    assert pipeline._should_accept_final_text_without_continuation(
-        messages,
-        "頁面已載入，接著確認 3D 場景是否正常渲染。",
-    )
-    assert not pipeline._should_accept_final_text_without_continuation(messages, " \n\t ")
-
-
-def test_final_text_shortcut_requires_a_matching_current_tool_result_id():
-    openai_request = normalize_openai(
-        {
-            "messages": [
-                {"role": "user", "content": "Read config.txt."},
-                {
-                    "role": "assistant",
-                    "tool_calls": [
-                        {
-                            "id": "call_read",
-                            "type": "function",
-                            "function": {"name": "read_file", "arguments": "{}"},
-                        }
-                    ],
-                },
-                {"role": "tool", "tool_call_id": "call_read", "content": "contents"},
-            ]
-        }
-    )
-    anthropic_request = normalize_anthropic(
-        {
-            "model": "claude-opus-4-6",
-            "messages": [
-                {"role": "user", "content": "Read config.txt."},
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_read",
-                            "name": "read_file",
-                            "input": {},
-                        }
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_read",
-                            "content": "contents",
-                        }
-                    ],
-                },
-            ],
-        }
-    )
-
-    assert pipeline._should_accept_final_text_without_continuation(
-        openai_request.messages, "The configuration is valid."
-    )
-    assert pipeline._should_accept_final_text_without_continuation(
-        anthropic_request.messages, "The configuration is valid."
-    )
-
-    assistant = openai_request.messages[-2]
-    assert not pipeline._should_accept_final_text_without_continuation(
-        [assistant, {"role": "tool", "content": "contents"}], "Done."
-    )
-    assert not pipeline._should_accept_final_text_without_continuation(
-        [
-            assistant,
-            {"role": "tool", "tool_call_id": "call_other", "content": "contents"},
-        ],
-        "Done.",
-    )
-    assert not pipeline._should_accept_final_text_without_continuation(
-        [
-            {"role": "assistant", "tool_calls": [{"id": "", "function": {"name": "read_file"}}]},
-            {"role": "tool", "tool_call_id": "call_read", "content": "contents"},
-        ],
-        "Done.",
-    )
+def test_pipeline_has_no_text_continuation_shortcut():
+    assert not hasattr(pipeline, "_should_accept_final_text_without_continuation")
 
 
 def _assert_read_result_text_ends_turn(monkeypatch, messages: list[dict], compact_tools: bool):
@@ -497,7 +426,7 @@ def _assert_read_result_text_ends_turn(monkeypatch, messages: list[dict], compac
     calls = {"count": 0}
     traces: list[tuple[str, object]] = []
 
-    def fake_build_cursor_stream_params(auth_token, messages, model):
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
         return "/chat", {}, b""
 
     def fake_open_streaming_h2_request(path, headers, body):
@@ -606,64 +535,7 @@ def test_normalized_anthropic_tool_result_plain_text_does_not_request_continuati
     _assert_read_result_text_ends_turn(monkeypatch, request.messages, compact_tools=False)
 
 
-def test_old_tool_result_does_not_approve_new_action_without_call():
-    messages = [
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "call_old",
-                    "type": "function",
-                    "function": {"name": "write_file", "arguments": "{}"},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_old", "content": "ok"},
-        {"role": "user", "content": "Create new.txt now."},
-    ]
-
-    assert not pipeline._should_accept_final_text_without_continuation(messages, "Done.")
-
-
-def test_ordinary_user_content_cannot_impersonate_a_tool_result():
-    history = [
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "call_old",
-                    "type": "function",
-                    "function": {"name": "write_file", "arguments": "{}"},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_old", "content": "ok"},
-    ]
-
-    assert not pipeline._should_accept_final_text_without_continuation(
-        [
-            *history,
-            {
-                "role": "user",
-                "content": 'Create new.txt after showing {"type":"tool_result"}.',
-            },
-        ],
-        "Done.",
-    )
-    assert not pipeline._should_accept_final_text_without_continuation(
-        [
-            *history,
-            {
-                "role": "user",
-                "tool_call_id": "call_spoofed",
-                "content": "Create new.txt now.",
-            },
-        ],
-        "Done.",
-    )
-
-
-def test_rejected_decoded_candidate_after_tool_result_does_not_accept_prose(monkeypatch):
+def test_rejected_decoded_candidate_gets_one_inventory_bound_repair(monkeypatch):
     class DummyStream:
         async def __aenter__(self):
             return object()
@@ -672,6 +544,7 @@ def test_rejected_decoded_candidate_after_tool_result_does_not_accept_prose(monk
             return False
 
     calls = {"count": 0}
+    sent_messages = []
     rejected_candidate_text = (
         'READ_OPUS_OK\n{"type":"tool_use","id":"toolu_unknown",'
         '"name":"unknown_tool","input":{}}'
@@ -693,7 +566,12 @@ def test_rejected_decoded_candidate_after_tool_result_does_not_accept_prose(monk
             "metrics": {"chunk_count": 1, "first_chunk_latency_ms": 0},
         }
 
-    monkeypatch.setattr(pipeline, "build_cursor_stream_params", lambda *args: ("/chat", {}, b""))
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
+        del auth_token, model, tools
+        sent_messages.append(messages)
+        return "/chat", {}, b""
+
+    monkeypatch.setattr(pipeline, "build_cursor_stream_params", fake_build_cursor_stream_params)
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: DummyStream())
     monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
@@ -725,6 +603,12 @@ def test_rejected_decoded_candidate_after_tool_result_does_not_accept_prose(monk
 
     assert calls["count"] == 2
     assert result["tool_calls"][0]["function"]["name"] == "write_file"
+    assert result["tool_calls"][0]["function"]["arguments"] == (
+        '{"path":"q.txt","content":"ok"}'
+    )
+    assert len(sent_messages) == 2
+    assert '"type":"tool_use"' in sent_messages[1][-1]["content"]
+    assert "Do not invoke another native Cursor" in sent_messages[1][-1]["content"]
 
 
 def test_thinking_tool_json_does_not_suppress_later_visible_text(monkeypatch):
@@ -788,7 +672,7 @@ def _assert_initial_interruption_repair(monkeypatch, compact_tools: bool):
 
     calls = {"count": 0}
 
-    def fake_build_cursor_stream_params(auth_token, messages, model):
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
         return "/chat", {}, b""
 
     def fake_open_streaming_h2_request(path, headers, body):
@@ -859,7 +743,7 @@ def test_noncompact_initial_interruption_repairs_with_complete_tool_call(monkeyp
     _assert_initial_interruption_repair(monkeypatch, compact_tools=False)
 
 
-def _assert_continuation_interruption_repair(monkeypatch, compact_tools: bool):
+def _assert_plain_text_never_enters_a_repair_or_continuation(monkeypatch, compact_tools: bool):
     class DummyStream:
         async def __aenter__(self):
             return object()
@@ -869,7 +753,7 @@ def _assert_continuation_interruption_repair(monkeypatch, compact_tools: bool):
 
     calls = {"count": 0}
 
-    def fake_build_cursor_stream_params(auth_token, messages, model):
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
         return "/chat", {}, b""
 
     def fake_open_streaming_h2_request(path, headers, body):
@@ -932,20 +816,20 @@ def _assert_continuation_interruption_repair(monkeypatch, compact_tools: bool):
         )
     )
 
-    assert calls["count"] == 3
-    assert len(result["tool_calls"]) == 1
-    assert result["tool_calls"][0]["function"]["name"] == "write_file"
+    assert calls["count"] == 1
+    assert result["text"] == "I will create the file."
+    assert result.get("tool_calls") is None
 
 
-def test_continuation_interruption_repairs_once_with_complete_tool_call(monkeypatch):
-    _assert_continuation_interruption_repair(monkeypatch, compact_tools=True)
+def test_compact_plain_text_never_enters_a_repair_or_continuation(monkeypatch):
+    _assert_plain_text_never_enters_a_repair_or_continuation(monkeypatch, compact_tools=True)
 
 
-def test_noncompact_continuation_interruption_repairs_with_complete_tool_call(monkeypatch):
-    _assert_continuation_interruption_repair(monkeypatch, compact_tools=False)
+def test_noncompact_plain_text_never_enters_a_repair_or_continuation(monkeypatch):
+    _assert_plain_text_never_enters_a_repair_or_continuation(monkeypatch, compact_tools=False)
 
 
-def test_compact_tool_call_suppresses_stale_attempt_prose(monkeypatch):
+def test_capability_denial_retries_once_and_recovers_tool_call(monkeypatch):
     class DummyStream:
         async def __aenter__(self):
             return object()
@@ -954,8 +838,12 @@ def test_compact_tool_call_suppresses_stale_attempt_prose(monkeypatch):
             return False
 
     calls = {"count": 0}
+    denial = (
+        "This session has no terminal capability. "
+        "目前會話沒有檔案寫入工具，因此無法建立 q.html。"
+    )
 
-    def fake_build_cursor_stream_params(auth_token, messages, model):
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
         return "/chat", {}, b""
 
     def fake_open_streaming_h2_request(path, headers, body):
@@ -966,9 +854,10 @@ def test_compact_tool_call_suppresses_stale_attempt_prose(monkeypatch):
         callback = on_text_delta
         if calls["count"] == 1:
             if callback:
-                callback("This session has no file-writing tool.")
+                for fragment in (denial[:8], denial[8:22], denial[22:]):
+                    callback(fragment)
             return {
-                "text": "This session has no file-writing tool.",
+                "text": denial,
                 "thinking": "",
                 "composer_tool_calls": [],
                 "has_fatal_error": False,
@@ -1016,6 +905,10 @@ def test_compact_tool_call_suppresses_stale_attempt_prose(monkeypatch):
 
     sse = asyncio.run(collect())
     objs = _sse_data_objects(sse)
+    streamed_text = "".join(
+        (obj.get("choices") or [{}])[0].get("delta", {}).get("content", "")
+        for obj in objs
+    )
     has_tool_call = any(
         (
             ((obj.get("choices") or [{}])[0].get("delta", {}).get("tool_calls") or [{}])[0]
@@ -1027,8 +920,27 @@ def test_compact_tool_call_suppresses_stale_attempt_prose(monkeypatch):
 
     assert calls["count"] == 2
     assert has_tool_call, sse
-    assert "This session has no file-writing tool." not in sse
+    assert streamed_text == denial
     assert '"type":"tool_use"' not in sse
+
+
+def test_capability_denial_requires_a_matching_advertised_capability():
+    denial = "目前工作階段沒有可用的檔案寫入工具，而且工作區路徑未知。"
+
+    assert pipeline._looks_like_false_capability_denial(denial, ["write_file"])
+    assert not pipeline._looks_like_false_capability_denial(denial, ["web_search"])
+    assert pipeline._looks_like_false_capability_denial(
+        "This session has no tools available.",
+        ["web_search"],
+    )
+    assert pipeline._looks_like_false_capability_denial(
+        "目前沒有可用的 `write_file` 工具，無法執行建立檔案。",
+        ["write_file"],
+    )
+    assert not pipeline._looks_like_false_capability_denial(
+        "我沒有使用 write_file，因為這次只需要回答問題。",
+        ["write_file"],
+    )
 
 
 def test_failed_repair_spends_allowance_before_fallback(monkeypatch):
@@ -1067,7 +979,7 @@ def test_failed_repair_spends_allowance_before_fallback(monkeypatch):
             "metrics": {"chunk_count": 1, "first_chunk_latency_ms": 0},
         }
 
-    def fake_build_cursor_stream_params(auth_token, messages, model):
+    def fake_build_cursor_stream_params(auth_token, messages, model, tools=None):
         requested_models.append(model)
         return "/chat", {}, b""
 
@@ -1170,6 +1082,72 @@ def test_openai_stream_yields_reasoning_before_a_tool_enabled_cursor_call_comple
     asyncio.run(assert_incremental_reasoning())
 
 
+def test_openai_stream_preserves_text_and_reasoning_wire_lanes(monkeypatch):
+    """Reasoning-like prose stays visible when upstream marks it as text."""
+    visible = (
+        "I'll build the file. The Write tool needs different arguments, "
+        "so I'll retry."
+    )
+    hidden = "Privately inspect the exact request-scoped tool schema."
+
+    async def fake_call_cursor_direct(
+        messages,
+        model,
+        tools,
+        valid_tool_names,
+        auth_token,
+        on_stream_delta=None,
+        on_thinking_delta=None,
+        compact_tools=False,
+    ):
+        assert compact_tools is True
+        assert on_stream_delta is not None
+        assert on_thinking_delta is not None
+        on_stream_delta(visible)
+        on_thinking_delta(hidden)
+        return {
+            "tool_calls": [],
+            "text": visible,
+            "thinking": hidden,
+            "model": model,
+            "fallback_attempts": 0,
+            "stats": {},
+        }
+
+    monkeypatch.setattr(pipeline, "_call_cursor_direct", fake_call_cursor_direct)
+    result = pipeline._build_streaming_result_openai(
+        request_id="preserve-wire-lanes",
+        messages=[{"role": "user", "content": "Write x.txt."}],
+        tools=[{"name": "write", "input_schema": {"type": "object"}}],
+        valid_tool_names=["write"],
+        resolved_model="future-vendor-model",
+        max_tokens=None,
+        token="tok",
+        pipeline_start=0,
+        base_telemetry={},
+    )
+
+    async def collect() -> list[dict]:
+        objects: list[dict] = []
+        async for chunk in result["stream_handler"]():
+            objects.extend(_sse_data_objects(chunk))
+        return objects
+
+    objects = asyncio.run(collect())
+    deltas = [
+        (item.get("choices") or [{}])[0].get("delta", {})
+        for item in objects
+        if item.get("choices")
+    ]
+    visible_result = "".join(delta.get("content", "") for delta in deltas)
+    hidden_result = "".join(
+        delta.get("reasoning_content", "") for delta in deltas
+    )
+    assert visible_result == visible
+    assert hidden_result == hidden
+    assert visible not in hidden_result
+
+
 def test_openai_reasoning_lane_split_tool_json_is_hidden_and_renders_a_tool_call(monkeypatch):
     """Adapter-decoded native JSON must never leak through either OpenAI delta lane."""
     tool_json = (
@@ -1205,9 +1183,42 @@ def test_openai_reasoning_lane_split_tool_json_is_hidden_and_renders_a_tool_call
             "metrics": {"chunk_count": 3, "first_chunk_latency_ms": 0},
         }
 
+    async def fake_agent(
+        messages,
+        model,
+        tools,
+        auth_token,
+        on_text_delta=None,
+        on_thinking_delta=None,
+    ):
+        del messages, model, tools, auth_token, on_text_delta
+        if on_thinking_delta:
+            on_thinking_delta("Planning the write. ")
+        arguments = {"path": "x.txt", "content": "ok"}
+        return {
+            "text": "",
+            "thinking": "Planning the write. ",
+            "composer_tool_calls": [],
+            "native_tool_calls": [
+                NativeToolCall(
+                    enum=49,
+                    call_id="toolu_reasoning",
+                    name="write_file",
+                    raw_arguments=json.dumps(arguments),
+                    arguments=arguments,
+                )
+            ],
+            "interrupted_tool_state": "",
+            "has_fatal_error": False,
+            "errors": [],
+            "had_content": True,
+            "metrics": {"chunk_count": 2, "first_chunk_latency_ms": 0},
+        }
+
     monkeypatch.setattr(pipeline, "build_cursor_stream_params", lambda *args: ("/chat", {}, b""))
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: DummyStream())
     monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
@@ -1373,6 +1384,58 @@ def test_closing_openai_stream_cancels_unfinished_cursor_task(monkeypatch):
     monkeypatch.setattr(pipeline, "_call_cursor_direct", fake_call_cursor_direct)
     result = pipeline._build_streaming_result_openai(
         request_id="cancel-cursor-task",
+        messages=[],
+        tools=[],
+        valid_tool_names=[],
+        resolved_model="gpt-5.6-sol",
+        max_tokens=None,
+        token="tok",
+        pipeline_start=0,
+        base_telemetry={},
+    )
+
+    async def close_stream() -> None:
+        stream = result["stream_handler"]()
+        await anext(stream)
+        next_chunk = asyncio.create_task(anext(stream))
+        await asyncio.wait_for(cursor_started.wait(), timeout=0.2)
+        next_chunk.cancel()
+        try:
+            await next_chunk
+        except asyncio.CancelledError:
+            pass
+        await stream.aclose()
+        await asyncio.wait_for(cursor_cancelled.wait(), timeout=0.2)
+
+    asyncio.run(close_stream())
+
+
+def test_closing_anthropic_stream_cancels_unfinished_cursor_task(monkeypatch):
+    cursor_started = asyncio.Event()
+    cursor_cancelled = asyncio.Event()
+    never_return = asyncio.Event()
+
+    async def fake_call_cursor_direct(
+        messages,
+        model,
+        tools,
+        valid_tool_names,
+        auth_token,
+        on_stream_delta=None,
+        on_thinking_delta=None,
+        compact_tools=False,
+    ):
+        cursor_started.set()
+        try:
+            await never_return.wait()
+        except asyncio.CancelledError:
+            cursor_cancelled.set()
+            raise
+        return {"model": model}
+
+    monkeypatch.setattr(pipeline, "_call_cursor_direct", fake_call_cursor_direct)
+    result = pipeline._build_streaming_result_anthropic(
+        request_id="cancel-anthropic-cursor-task",
         messages=[],
         tools=[],
         valid_tool_names=[],

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 from claude_code.composer_tool_parser import ComposerEmit, ComposerStreamProcessor
-from claude_code.tool_prompt_builder import build_tool_call_prompt
+from config.system_prompt import COMPOSER_TOOL_PROMPT_HEADER
 from claude_code.tool_protocols import (
     DecodedToolCandidate,
     ProtocolDecodeResult,
@@ -23,28 +25,23 @@ class ComposerMarkerV1Adapter:
         self._next_call_id = 0
 
     def render_tool_manifest(self, tools: list[dict], execution_policy: str) -> str:
-        """Render the existing Composer marker instructions with policy context."""
-        return f"{execution_policy}\n\n{build_tool_call_prompt(tools, composer=True)}"
-
-    def render_continuation(
-        self,
-        tools: list[dict],
-        user_intent: str,
-        prior_output: str,
-    ) -> str:
-        """Continue with the marker grammar used by Composer-2 streams."""
-        manifest = self.render_tool_manifest(tools, "Continue the requested work.")
+        """Render deterministic schemas with Composer's marker grammar."""
+        serialized_tools = json.dumps(
+            tools, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
         return (
-            f"{manifest}\n\nOriginal request: {user_intent}\n"
-            f"Previous output: {prior_output}\n"
-            "For actions, use the marker protocol from the tool manifest."
+            f"{execution_policy}\n\n{COMPOSER_TOOL_PROMPT_HEADER}\n"
+            "Available client tools are the following JSON schemas:\n"
+            f"{serialized_tools}"
         )
 
     def render_repair(self, tools: list[dict], interrupted_state: str) -> str:
         """Request a new complete marker block after interrupted output."""
-        manifest = self.render_tool_manifest(tools, "Repair the interrupted tool call.")
+        del tools
         return (
-            f"{manifest}\n\nInterrupted output: {interrupted_state}\n"
+            "Repair the interrupted tool call. The existing system instruction contains "
+            "the client tool schemas and marker grammar.\n"
+            f"Interrupted output: {interrupted_state}\n"
             "Start over with one complete <|tool_calls_begin|> block."
         )
 

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from google.protobuf.unknown_fields import UnknownFieldSet
 
 from proto import cursor_api_pb2 as pb
+from core.protobuf_tool_call_parser import NativeToolCall, extract_native_tool_calls
 
 from utils.structured_logging import ThalamusStructuredLogger
 
@@ -44,6 +45,7 @@ class ParseResult:
     text: str = ""
     errors: list[ParsedError] = field(default_factory=list)
     context_remaining_percent: float | None = None
+    native_tool_calls: list[NativeToolCall] = field(default_factory=list)
 
 
 def _extract_context_remaining_percent(message) -> float | None:
@@ -131,6 +133,7 @@ class ProtobufFrameParser:
         text_parts: list[str] = []
         errors: list[ParsedError] = []
         context_remaining_percent: float | None = None
+        native_tool_calls: list[NativeToolCall] = []
 
         while len(self._buf) >= 5:
             magic = self._buf[0]
@@ -148,6 +151,7 @@ class ProtobufFrameParser:
                     logger.debug(f"Frame magic={magic} raw_len={len(raw_data)} hex_head={raw_data[:40].hex()}")
                     response = pb.StreamUnifiedChatWithToolsResponse()
                     response.ParseFromString(raw_data)
+                    native_tool_calls.extend(extract_native_tool_calls(raw_data))
 
                     if response.HasField("message"):
                         msg = response.message
@@ -196,6 +200,7 @@ class ProtobufFrameParser:
             text="".join(text_parts),
             errors=errors,
             context_remaining_percent=context_remaining_percent,
+            native_tool_calls=native_tool_calls,
         )
 
 

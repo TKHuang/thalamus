@@ -6,9 +6,6 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from config.tool_registry import normalize_tool_name
-
-
 @dataclass(frozen=True)
 class ToolRejection:
     """A decoded tool call that was not safe to expose to an executor."""
@@ -25,24 +22,19 @@ class ToolValidationResult:
     rejected: tuple[ToolRejection, ...]
 
 
-def _advertised_name(name: str, allowed_names: set[str]) -> str | None:
-    """Return the original advertised spelling for an exact case-insensitive match."""
-    for allowed_name in allowed_names:
-        if name.casefold() == allowed_name.casefold():
-            return allowed_name
-    return None
-
-
 def _resolve_allowed_name(raw_name: str, allowed_names: set[str]) -> str | None:
-    """Resolve a name without allowing registry aliases to expand authorization."""
-    exact_name = _advertised_name(raw_name, allowed_names)
-    if exact_name is not None:
-        return exact_name
+    """Resolve Cursor's MCP leaf back to one exact request-owned function name.
 
-    normalized_name = normalize_tool_name(raw_name)["normalized"]
-    if not isinstance(normalized_name, str):
-        return None
-    return _advertised_name(normalized_name, allowed_names)
+    Cursor can return ``toolName`` without the MCP server namespace even when
+    the client advertised a flattened ``server_tool`` function.  Exact names
+    always win.  A leaf is accepted only when it identifies one unique
+    advertised suffix; ambiguity and arbitrary aliases remain fail-closed.
+    """
+    if raw_name in allowed_names:
+        return raw_name
+    suffix = f"_{raw_name}"
+    matches = [name for name in allowed_names if name.endswith(suffix)]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _reject_json_constant(value: str) -> None:
@@ -73,11 +65,6 @@ def _normalized_arguments(raw_arguments: object) -> tuple[str | None, dict | Non
     return serialized, arguments, None
 
 
-def _has_valid_task_complete_result(arguments: dict) -> bool:
-    result = arguments.get("result")
-    return isinstance(result, str) and bool(result.strip())
-
-
 def _candidate_parts(candidate: object) -> tuple[str, str, object] | None:
     """Extract the minimal executor representation from supported decoded forms."""
     if isinstance(candidate, dict):
@@ -104,29 +91,19 @@ def _candidate_parts(candidate: object) -> tuple[str, str, object] | None:
 def _validate_candidate(
     candidate: object,
     allowed_names: set[str],
-    allow_internal_task_complete: bool,
 ) -> tuple[dict | None, ToolRejection | None]:
     parts = _candidate_parts(candidate)
     if parts is None:
         return None, ToolRejection(raw_name="", reason="invalid_candidate")
 
     call_id, raw_name, raw_arguments = parts
-    resolved_name = (
-        "task_complete"
-        if allow_internal_task_complete and raw_name == "task_complete"
-        else _resolve_allowed_name(raw_name, allowed_names)
-    )
+    resolved_name = _resolve_allowed_name(raw_name, allowed_names)
     if resolved_name is None:
         return None, ToolRejection(raw_name=raw_name, reason="unknown_tool")
 
-    arguments, argument_object, reason = _normalized_arguments(raw_arguments)
+    arguments, _argument_object, reason = _normalized_arguments(raw_arguments)
     if reason is not None:
         return None, ToolRejection(raw_name=raw_name, reason=reason)
-    if resolved_name == "task_complete" and (
-        argument_object is None or not _has_valid_task_complete_result(argument_object)
-    ):
-        return None, ToolRejection(raw_name=raw_name, reason="invalid_task_complete_result")
-
     return {
         "id": call_id,
         "type": "function",
@@ -137,8 +114,6 @@ def _validate_candidate(
 def validate_tool_candidates(
     candidates: Iterable[object] | None,
     allowed_names: set[str],
-    *,
-    allow_internal_task_complete: bool = False,
 ) -> ToolValidationResult:
     """Authorize decoded calls against only names advertised by this request."""
     allowed = {name for name in allowed_names if isinstance(name, str) and name}
@@ -149,7 +124,6 @@ def validate_tool_candidates(
         executable, rejection = _validate_candidate(
             candidate,
             allowed,
-            allow_internal_task_complete,
         )
         if executable is not None:
             accepted.append(executable)

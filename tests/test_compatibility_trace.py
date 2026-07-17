@@ -15,6 +15,7 @@ from claude_code.compatibility_trace import (  # noqa: E402
     emit_terminal_trace,
 )
 from core.unified_request import UnifiedRequest  # noqa: E402
+from core.protobuf_tool_call_parser import NativeToolCall  # noqa: E402
 from utils import llm_payload_logger, thalamus_api_logger  # noqa: E402
 from utils.raw_payload_logging import is_raw_payload_logging_enabled  # noqa: E402
 
@@ -56,12 +57,37 @@ def _consumed(text: str, thinking: str, errors: list[object] | None = None) -> d
         "text": text,
         "thinking": thinking,
         "composer_tool_calls": [],
+        "native_tool_calls": [],
         "interrupted_tool_state": "",
         "errors": errors or [],
         "had_content": bool(text or thinking),
         "has_fatal_error": False,
         "metrics": {"chunk_count": 1, "first_chunk_latency_ms": 0},
     }
+
+
+def _native_tool_consumed(
+    *,
+    call_id: str = "call_1",
+    name: str = "write_file",
+    arguments: dict | None = None,
+    text: str = "",
+    thinking: str = "",
+    errors: list[object] | None = None,
+) -> dict:
+    value = _consumed(text, thinking, errors)
+    args = arguments or {"content": SENTINELS[2]}
+    value["native_tool_calls"] = [
+        NativeToolCall(
+            enum=49,
+            call_id=call_id,
+            name=name,
+            raw_arguments=json.dumps(args),
+            arguments=args,
+        )
+    ]
+    value["had_content"] = True
+    return value
 
 
 def _set_raw_logging(value: str | None) -> str | None:
@@ -94,21 +120,14 @@ def test_trace_events_keep_only_approved_stable_fields(monkeypatch):
     )
     monkeypatch.setattr(pipeline, "build_cursor_stream_params", lambda *args: ("/chat", {}, b""))
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: _DummyStream())
-    monkeypatch.setattr(
-        pipeline,
-        "consume_stream",
-        lambda *args, **kwargs: _async_result(
-            _consumed(
-                text=(
-                    f"{SENTINELS[1]} "
-                    '{"type":"tool_use","id":"call_1","name":"write_file",'
-                    f'"input":{{"content":"{SENTINELS[2]}"}}}}'
-                ),
-                thinking=SENTINELS[3],
-                errors=[SENTINELS[5]],
-            )
-        ),
-    )
+    async def fake_agent(*args, **kwargs):
+        return _native_tool_consumed(
+            text=SENTINELS[1],
+            thinking=SENTINELS[3],
+            errors=[SENTINELS[5]],
+        )
+
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_agent)
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
@@ -143,32 +162,19 @@ def test_trace_events_keep_only_approved_stable_fields(monkeypatch):
         assert trace.accepted_tool_names == ("write_file",)
 
 
-def test_continuation_success_emits_unique_final_attempt_trace(monkeypatch):
+def test_plain_text_emits_one_attempt_and_final_trace(monkeypatch):
     captured: list[tuple[str, CompatibilityTrace]] = []
     calls = {"count": 0}
-    partial_text = (
-        '{"type":"tool_use","id":"call_partial","name":"write_file",'
-        f'"input":{{"content":"{SENTINELS[2]}"}}'
-    )
-    continuation_text = (
-        f"{SENTINELS[1]} "
-        '{"type":"tool_use","id":"call_2","name":"write_file",'
-        f'"input":{{"content":"{SENTINELS[2]}"}}}}'
-    )
 
     async def fake_consume_stream(*args, **kwargs):
         calls["count"] += 1
-        if calls["count"] == 1:
-            return _consumed(text="Initial prose response.", thinking=SENTINELS[3])
-        if calls["count"] == 2:
-            return _consumed(text=partial_text, thinking="")
-        return _consumed(text=continuation_text, thinking="")
+        return _consumed(text="Initial prose response.", thinking=SENTINELS[3])
 
     monkeypatch.setattr(pipeline, "emit_attempt_trace", lambda trace: captured.append(("attempt", trace)))
     monkeypatch.setattr(pipeline, "emit_terminal_trace", lambda trace: captured.append(("terminal", trace)))
     monkeypatch.setattr(pipeline, "build_cursor_stream_params", lambda *args: ("/chat", {}, b""))
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: _DummyStream())
-    monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_consume_stream)
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
@@ -183,39 +189,38 @@ def test_continuation_success_emits_unique_final_attempt_trace(monkeypatch):
         )
     )
 
-    assert result["tool_calls"][0]["function"]["name"] == "write_file"
-    assert [kind for kind, _trace in captured] == ["attempt", "attempt", "attempt", "terminal"]
+    assert calls["count"] == 1
+    assert result["text"] == "Initial prose response."
+    assert [kind for kind, _trace in captured] == ["attempt", "terminal"]
     attempt_ids = [trace.attempt_id for kind, trace in captured if kind == "attempt"]
-    assert len(attempt_ids) == len(set(attempt_ids)) == 3
+    assert len(attempt_ids) == len(set(attempt_ids)) == 1
     terminal_trace = captured[-1][1]
     assert terminal_trace.attempt_id == attempt_ids[-1]
-    assert terminal_trace.terminal_result == "tool_calls"
-    assert terminal_trace.text_bytes == len(continuation_text.encode("utf-8"))
-    assert terminal_trace.reasoning_bytes == 0
-    assert terminal_trace.tool_candidate_source == "text"
-    assert terminal_trace.candidate_count == 1
-    assert terminal_trace.accepted_tool_names == ("write_file",)
-    assert terminal_trace.repair_attempted
+    assert terminal_trace.terminal_result == "final_text"
+    assert terminal_trace.text_bytes == len("Initial prose response.".encode("utf-8"))
+    assert terminal_trace.reasoning_bytes == len(SENTINELS[3].encode("utf-8"))
+    assert terminal_trace.tool_candidate_source is None
+    assert terminal_trace.candidate_count == 0
+    assert terminal_trace.accepted_tool_names == ()
+    assert not terminal_trace.repair_attempted
     serialized = json.dumps([trace for _kind, trace in captured], default=lambda value: value.__dict__)
     for sentinel in SENTINELS:
         assert sentinel not in serialized
 
 
-def test_continuation_failure_emits_unique_error_attempt_and_terminal(monkeypatch):
+def test_interrupted_json_repair_failure_emits_error_attempt_and_terminal(monkeypatch):
     captured: list[tuple[str, CompatibilityTrace]] = []
     calls = {"count": 0}
 
     async def fake_consume_stream(*args, **kwargs):
         calls["count"] += 1
-        if calls["count"] == 1:
-            return _consumed(text="Initial prose response.", thinking="")
         raise RuntimeError(SENTINELS[5])
 
     monkeypatch.setattr(pipeline, "emit_attempt_trace", lambda trace: captured.append(("attempt", trace)))
     monkeypatch.setattr(pipeline, "emit_terminal_trace", lambda trace: captured.append(("terminal", trace)))
     monkeypatch.setattr(pipeline, "build_cursor_stream_params", lambda *args: ("/chat", {}, b""))
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: _DummyStream())
-    monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_consume_stream)
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_api_call", lambda *args, **kwargs: None)
@@ -230,10 +235,10 @@ def test_continuation_failure_emits_unique_error_attempt_and_terminal(monkeypatc
         )
     )
 
-    assert result.get("error") is None
-    assert [kind for kind, _trace in captured] == ["attempt", "attempt", "terminal"]
+    assert SENTINELS[5] in result["error"]
+    assert [kind for kind, _trace in captured] == ["attempt", "terminal"]
     attempt_ids = [trace.attempt_id for kind, trace in captured if kind == "attempt"]
-    assert len(attempt_ids) == len(set(attempt_ids)) == 2
+    assert len(attempt_ids) == len(set(attempt_ids)) == 1
     terminal_trace = captured[-1][1]
     assert terminal_trace.attempt_id == attempt_ids[-1]
     assert terminal_trace.terminal_result == "upstream_error"
@@ -250,11 +255,7 @@ def test_continuation_failure_emits_unique_error_attempt_and_terminal(monkeypatc
 def test_fallback_trace_records_safe_reason_and_final_model(monkeypatch):
     captured: list[tuple[str, CompatibilityTrace]] = []
     calls = {"count": 0}
-    final_text = (
-        f"{SENTINELS[1]} "
-        '{"type":"tool_use","id":"call_fallback","name":"write_file",'
-        f'"input":{{"content":"{SENTINELS[2]}"}}}}'
-    )
+    final_text = SENTINELS[1]
 
     class FallbackConfig:
         max_attempts = 2
@@ -271,13 +272,17 @@ def test_fallback_trace_records_safe_reason_and_final_model(monkeypatch):
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError(SENTINELS[5])
-        return _consumed(text=final_text, thinking="")
+        return _native_tool_consumed(
+            call_id="call_fallback",
+            arguments={"content": SENTINELS[2]},
+            text=SENTINELS[1],
+        )
 
     monkeypatch.setattr(pipeline, "emit_attempt_trace", lambda trace: captured.append(("attempt", trace)))
     monkeypatch.setattr(pipeline, "emit_terminal_trace", lambda trace: captured.append(("terminal", trace)))
     monkeypatch.setattr(pipeline, "build_cursor_stream_params", lambda *args: ("/chat", {}, b""))
     monkeypatch.setattr(pipeline, "open_streaming_h2_request", lambda *args: _DummyStream())
-    monkeypatch.setattr(pipeline, "consume_stream", fake_consume_stream)
+    monkeypatch.setattr(pipeline, "call_cursor_agent", fake_consume_stream)
     monkeypatch.setattr(pipeline, "load_fallback_config", lambda: FallbackConfig())
     monkeypatch.setattr(pipeline, "log_llm_request", lambda *args, **kwargs: "")
     monkeypatch.setattr(pipeline, "log_llm_response", lambda *args, **kwargs: "")

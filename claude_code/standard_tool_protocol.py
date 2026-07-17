@@ -19,26 +19,7 @@ from claude_code.tool_protocols import (
 )
 
 _NATIVE_TOOL_TYPE = "tool_use"
-_TOOL_JSON_EXAMPLE = '{"type":"tool_use","id":"toolu_<unique>","name":"<exact_tool_name>","input":{...}}'
-_REQUESTED_PATH_RE = re.compile(r"(?:[~./\w-]+/)?[\w.-]+\.(?:html|htm|js|ts|tsx|jsx|py|md|json|css|txt|yaml|yml|toml|sh|sql|csv)", re.I)
 _NATIVE_TOOL_TYPE_RE = re.compile(r'"type"\s*:\s*"tool_use"')
-
-
-def _tool_names(tools: list[dict]) -> set[str]:
-    return {
-        name
-        for tool in tools
-        for name in [(tool.get("function") or tool).get("name")]
-        if isinstance(name, str) and name
-    }
-
-
-def _requested_path(user_intent: str, prior_output: str) -> str:
-    for text in (user_intent, prior_output):
-        match = _REQUESTED_PATH_RE.search(text)
-        if match:
-            return match.group(0)
-    return ""
 
 
 def _contains_native_tool_prefix(text: str) -> bool:
@@ -170,56 +151,26 @@ class StandardJsonV1Adapter:
     protocol = ToolProtocol.STANDARD_JSON_V1
 
     def render_tool_manifest(self, tools: list[dict], execution_policy: str) -> str:
-        """Render schemas unchanged so the model sees their native structure."""
+        """Make native tools visible without asking for hand-authored tool JSON."""
         serialized_tools = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
         return (
             f"{execution_policy}\n\n"
-            "Available client tools are the following JSON schemas:\n"
-            f"{serialized_tools}\n\n"
+            "Available client tools are exposed through native function calling.\n"
+            "Exact available client tool schemas:\n"
+            f"{serialized_tools}\n"
             f"{CLIENT_TOOL_INVENTORY_AUTHORITY_RULE}\n"
             f"{POST_TOOL_OUTPUT_FORMAT_RULE}\n"
-            "For every action, output one complete native tool_use JSON object per line:\n"
-            f"{_TOOL_JSON_EXAMPLE}"
-        )
-
-    def render_continuation(
-        self,
-        tools: list[dict],
-        user_intent: str,
-        prior_output: str,
-    ) -> str:
-        """Request a fresh strict-protocol continuation without changing schemas."""
-        manifest = self.render_tool_manifest(tools, "Continue the requested work.")
-        path = _requested_path(user_intent, prior_output)
-        if "write_file" in _tool_names(tools) and path:
-            example = json.dumps(
-                {
-                    "type": "tool_use",
-                    "id": "toolu_write",
-                    "name": "write_file",
-                    "input": {"path": path, "content": "<complete file content>"},
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            action_instruction = (
-                "Output one complete write_file tool_use object now. No prose or Markdown.\n"
-                f"Example: {example}"
-            )
-        else:
-            action_instruction = "Continue from the previous output. Emit a complete tool_use object when action is needed."
-        return (
-            f"{manifest}\n\n"
-            f"Original request: {user_intent}\n"
-            f"Previous output: {prior_output}\n"
-            f"{action_instruction}"
+            "Use the exact advertised tool name and schema. If the current request "
+            "requires an action, issue the native tool call in this response. Do not "
+            "copy schemas or emit tool-call JSON as assistant prose."
         )
 
     def render_repair(self, tools: list[dict], interrupted_state: str) -> str:
         """Ask for one replacement call after a recognized partial native object."""
-        manifest = self.render_tool_manifest(tools, "Repair the interrupted tool call.")
+        del tools
         return (
-            f"{manifest}\n\n"
+            "Repair the interrupted tool call. The existing system instruction contains "
+            "the client tool schemas and protocol.\n"
             f"Interrupted output: {interrupted_state}\n"
             "Start over and emit one fresh, complete tool_use JSON object. Do not continue truncated JSON."
         )

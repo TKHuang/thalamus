@@ -37,6 +37,10 @@ class StreamingAnthropicSession:
         self.text_index = -1
         self.thinking_open = False
         self.text_open = False
+        self.tool_open = False
+        self.tool_index = -1
+        self.tool_id = ""
+        self.tool_name = ""
         self.total_text_len = 0
         self.total_thinking_len = 0
 
@@ -62,6 +66,10 @@ class StreamingAnthropicSession:
         )
         ping = self._format("ping", {"type": "ping"})
         return message_start + ping
+
+    def emit_keepalive(self) -> str:
+        """Emit Anthropic's protocol-level, non-visible ping event."""
+        return self._format("ping", {"type": "ping"})
 
     def emit_thinking_delta(self, text: str) -> str:
         out: list[str] = []
@@ -147,7 +155,65 @@ class StreamingAnthropicSession:
                 )
             )
             self.text_open = False
+        if self.tool_open:
+            out.append(
+                self._format(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": self.tool_index},
+                )
+            )
+            self.tool_open = False
         return "".join(out)
+
+    def emit_tool_call_start(self, tc_id: str, name: str) -> str:
+        """Expose a native tool as soon as Cursor announces its identity."""
+        if self.tool_open:
+            return ""
+        out = self.close_open_blocks()
+        self.tool_index = self.block_index
+        self.block_index += 1
+        self.tool_id = tc_id
+        self.tool_name = name
+        self.tool_open = True
+        return out + self._format(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": self.tool_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tc_id,
+                    "name": name,
+                    "input": {},
+                },
+            },
+        )
+
+    def finish_tool_call(self, args: str | dict[str, Any]) -> str:
+        """Finish the currently announced tool with its authoritative args."""
+        if not self.tool_open:
+            return ""
+        if isinstance(args, dict):
+            partial_json = json.dumps(args)
+        else:
+            partial_json = args if isinstance(args, str) else "{}"
+        out = self._format(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": self.tool_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": partial_json,
+                },
+            },
+        )
+        out += self._format(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": self.tool_index},
+        )
+        self.tool_open = False
+        return out
 
     def emit_tool_use_blocks(self, tool_calls: list[dict[str, Any]]) -> str:
         out: list[str] = []
@@ -161,42 +227,8 @@ class StreamingAnthropicSession:
             else:
                 parsed = parse_tool_input(args_str if isinstance(args_str, str) else "{}")
 
-            out.append(
-                self._format(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": self.block_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tc_id,
-                            "name": name,
-                            "input": {},
-                        },
-                    },
-                )
-            )
-            partial_json = json.dumps(parsed)
-            out.append(
-                self._format(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": self.block_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": partial_json,
-                        },
-                    },
-                )
-            )
-            out.append(
-                self._format(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": self.block_index},
-                )
-            )
-            self.block_index += 1
+            out.append(self.emit_tool_call_start(tc_id, name))
+            out.append(self.finish_tool_call(parsed))
         return "".join(out)
 
     def finish(self, stop_reason: str = "end_turn") -> str:

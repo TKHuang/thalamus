@@ -21,6 +21,29 @@ CURSOR_CLOUDFLARE_IP: str = os.environ.get("CURSOR_CLOUDFLARE_IP", "104.18.19.12
 CURSOR_API_HOST: str = "api2.cursor.sh"
 
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+# Cursor may announce a native tool call, then stay silent while generating the
+# complete argument payload. Large single-file writes have exceeded 120 seconds
+# before arriving as one frame, so streaming reads need a separate budget.
+_DEFAULT_STREAM_READ_TIMEOUT_SECONDS = 600.0
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+_STREAMING_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    read=_positive_float_env(
+        "CURSOR_STREAM_READ_TIMEOUT_SECONDS",
+        _DEFAULT_STREAM_READ_TIMEOUT_SECONDS,
+    ),
+    write=120.0,
+    pool=120.0,
+)
 
 
 def _build_ssl_context() -> ssl.SSLContext:
@@ -64,7 +87,11 @@ class _CloudflareOverrideBackend(httpcore.AsyncNetworkBackend):
         await self._inner.sleep(seconds)
 
 
-def _build_client() -> httpx.AsyncClient:
+def _build_client(
+    *,
+    timeout: httpx.Timeout = _TIMEOUT,
+    base_url: str | None = None,
+) -> httpx.AsyncClient:
     """Build an httpx AsyncClient that routes api2.cursor.sh to the Cloudflare IP.
 
     The URL host stays as api2.cursor.sh so httpx/httpcore use it for TLS SNI.
@@ -86,8 +113,8 @@ def _build_client() -> httpx.AsyncClient:
 
     return httpx.AsyncClient(
         transport=transport,
-        base_url=f"https://{CURSOR_API_HOST}",
-        timeout=_TIMEOUT,
+        base_url=base_url or f"https://{CURSOR_API_HOST}",
+        timeout=timeout,
     )
 
 
@@ -96,6 +123,8 @@ async def open_streaming_h2_request(
     path: str,
     headers: dict[str, str],
     body: bytes,
+    *,
+    base_url: str | None = None,
 ) -> AsyncIterator[AsyncIterator[bytes]]:
     """Open a server-streaming HTTP/2 POST to api2.cursor.sh.
 
@@ -103,23 +132,40 @@ async def open_streaming_h2_request(
     call). The context manager will forcefully close the connection rather than
     waiting for the server to finish the stream.
     """
-    client = _build_client()
+    client_kwargs = {"timeout": _STREAMING_TIMEOUT}
+    if base_url is not None:
+        client_kwargs["base_url"] = base_url
+    client = _build_client(**client_kwargs)
     response_ctx = client.stream("POST", path, headers=headers, content=body)
-    response = await response_ctx.__aenter__()
+    response = None
+    stream_iterator = None
+    exit_args = (None, None, None)
     try:
+        response = await response_ctx.__aenter__()
+        stream_iterator = response.aiter_bytes()
         logger.debug(
             f"Streaming response started: status={response.status_code} path={path}"
         )
-        yield response.aiter_bytes()
+        try:
+            yield stream_iterator
+        except BaseException as exc:
+            exit_args = (type(exc), exc, exc.__traceback__)
+            raise
     finally:
-        try:
-            await response.aclose()
-        except Exception:
-            pass
-        try:
-            await response_ctx.__aexit__(None, None, None)
-        except Exception:
-            pass
+        if stream_iterator is not None:
+            try:
+                await stream_iterator.aclose()
+            except Exception:
+                pass
+        if response is not None:
+            try:
+                await response.aclose()
+            except Exception:
+                pass
+            try:
+                await response_ctx.__aexit__(*exit_args)
+            except Exception:
+                pass
         try:
             await client.aclose()
         except Exception:

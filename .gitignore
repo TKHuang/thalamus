@@ -12,6 +12,7 @@ build/
 *.egg
 .mypy_cache/
 .pytest_cache/
+.codegraph/
 vendor/
 logs/
 .DS_Store

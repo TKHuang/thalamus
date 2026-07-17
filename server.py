@@ -36,6 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from routes.anthropic_messages import router as anthropic_router
 from routes.openai_chat import router as openai_router
+from routes.openai_responses import router as openai_responses_router
 from routes.model_routes import router as model_router
 from routes.token_routes import router as token_router
 from routes.login_routes import router as login_router
@@ -52,6 +53,7 @@ app.add_middleware(
 
 app.include_router(anthropic_router)
 app.include_router(openai_router)
+app.include_router(openai_responses_router)
 app.include_router(model_router)
 app.include_router(token_router)
 app.include_router(login_router)

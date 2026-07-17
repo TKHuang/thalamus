@@ -45,6 +45,16 @@ class StreamingOpenAISession:
             }],
         ))
 
+    def emit_keepalive(self) -> str:
+        """Emit a valid, non-visible Chat Completions progress chunk."""
+        return _format_openai_sse(self._base_chunk(
+            choices=[{
+                "index": 0,
+                "delta": {},
+                "finish_reason": None,
+            }],
+        ))
+
     def emit_reasoning_delta(self, text: str) -> str:
         """Emit one OpenAI-compatible reasoning fragment without visible content."""
         self._total_text_len += len(text)

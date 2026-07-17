@@ -5,6 +5,7 @@ from __future__ import annotations
 Every field CC sends is preserved — nothing is silently dropped.
 """
 
+import copy
 import json
 import re
 from typing import Any
@@ -19,27 +20,9 @@ logger = ThalamusStructuredLogger.get_logger("normalizers", "DEBUG")
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _remove_uri_format(schema: Any) -> Any:
-    """Recursively strip format:'uri' from JSON-Schema nodes (Cursor rejects it)."""
-    if not schema or not isinstance(schema, dict):
-        return schema
-    if isinstance(schema, list):
-        return [_remove_uri_format(item) for item in schema]
-
-    if schema.get("type") == "string" and schema.get("format") == "uri":
-        return {k: v for k, v in schema.items() if k != "format"}
-
-    result: dict[str, Any] = {}
-    for key, value in schema.items():
-        if key == "properties" and isinstance(value, dict):
-            result[key] = {pk: _remove_uri_format(pv) for pk, pv in value.items()}
-        elif key in ("items", "additionalProperties") and isinstance(value, dict):
-            result[key] = _remove_uri_format(value)
-        elif key in ("anyOf", "allOf", "oneOf") and isinstance(value, list):
-            result[key] = [_remove_uri_format(item) for item in value]
-        else:
-            result[key] = _remove_uri_format(value)
-    return result
+def _copy_tool_schema(schema: Any) -> Any:
+    """Isolate a request schema without changing its client-provided meaning."""
+    return copy.deepcopy(schema)
 
 
 _CLAUDE_FALLBACK = "claude-4.5-haiku"
@@ -175,7 +158,7 @@ def normalize_anthropic(payload: dict) -> UnifiedRequest:
             "function": {
                 "name": t.get("name", ""),
                 "description": t.get("description", ""),
-                "parameters": _remove_uri_format(t.get("input_schema")),
+                "parameters": _copy_tool_schema(t.get("input_schema")),
             },
         }
         for t in original_tools
@@ -336,11 +319,14 @@ def normalize_openai(payload: dict) -> UnifiedRequest:
     """Convert an OpenAI Chat Completions API payload to UnifiedRequest."""
     raw_messages = payload.get("messages") or []
 
-    # Extract system messages and separate from conversation
+    # OpenAI-compatible clients may use either role for high-priority runtime
+    # context. Cursor's wire format has no developer role, so fold both into the
+    # instruction instead of accidentally serializing developer text as an
+    # assistant answer.
     system_parts: list[str] = []
     messages: list[dict[str, Any]] = []
     for msg in raw_messages:
-        if msg.get("role") == "system":
+        if msg.get("role") in ("system", "developer"):
             c = msg.get("content", "")
             if isinstance(c, str) and c:
                 system_parts.append(c)
@@ -365,7 +351,7 @@ def normalize_openai(payload: dict) -> UnifiedRequest:
             "function": {
                 "name": fn.get("name", ""),
                 "description": fn.get("description", ""),
-                "parameters": _remove_uri_format(fn.get("parameters")),
+                "parameters": _copy_tool_schema(fn.get("parameters")),
             },
         })
 
@@ -386,3 +372,99 @@ def normalize_openai(payload: dict) -> UnifiedRequest:
         context_management=None,
         tool_choice=payload.get("tool_choice"),
     )
+
+
+def normalize_openai_response(payload: dict) -> UnifiedRequest:
+    """Convert an OpenAI Responses API payload to UnifiedRequest."""
+    system_parts: list[str] = []
+    instructions = payload.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        system_parts.append(instructions)
+
+    messages: list[dict[str, Any]] = []
+    raw_input = payload.get("input", "")
+    if isinstance(raw_input, str):
+        if raw_input:
+            messages.append({"role": "user", "content": raw_input})
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type", "message")
+            role = item.get("role", "user")
+            if item_type == "function_call":
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": item.get("call_id", item.get("id", "")),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", "{}"),
+                        },
+                    }],
+                })
+                continue
+            if item_type == "function_call_output":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id", ""),
+                    "content": _flatten_tool_result_content(item.get("output")),
+                })
+                continue
+            if item_type == "reasoning":
+                continue
+
+            item_content = _responses_content_to_openai(item.get("content", ""))
+            if role in ("system", "developer"):
+                if item_content:
+                    system_parts.append(item_content)
+            else:
+                messages.append({"role": role, "content": item_content})
+
+    raw_tools = payload.get("tools") or []
+    ir_tools: list[dict[str, Any]] = []
+    for tool in raw_tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        ir_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": _copy_tool_schema(tool.get("parameters")),
+            },
+        })
+
+    original_model = payload.get("model", "")
+    return UnifiedRequest(
+        messages=messages,
+        system="\n\n".join(system_parts),
+        tools=ir_tools,
+        model=resolve_model_name(original_model),
+        stream=payload.get("stream") is True,
+        max_tokens=payload.get("max_output_tokens"),
+        original_format="openai_responses",
+        original_model=original_model,
+        original_tools=raw_tools,
+        metadata=payload.get("metadata"),
+        thinking=payload.get("reasoning"),
+        context_management=payload.get("context_management"),
+        tool_choice=payload.get("tool_choice"),
+    )
+
+
+def _responses_content_to_openai(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content) if content is not None else ""
+
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict) and part.get("type") in ("input_text", "output_text", "text"):
+            parts.append(part.get("text", ""))
+    return "\n".join(part for part in parts if part)
